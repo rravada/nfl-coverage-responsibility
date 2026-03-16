@@ -1,33 +1,56 @@
-Explainable Coverage Responsibility (WIP)
-========================================
+# NFL Coverage Responsibility Engine
 
-This project analyzes NFL player-tracking data to infer **defensive coverage responsibility** – which defender is responsible for which receiver – with an emphasis on explainability over raw predictive accuracy.
+Analyzes NFL player-tracking data to infer **which defender is responsible 
+for which receiver** on every passing play, using spatial geometry and 
+motion analysis. Emphasizes explainability over black-box prediction.
 
-Current status (Phase 2)
-------------------------
+![Voronoi Coverage Assignment](notebooks/outputs/voronoi_assignment_example.png)
 
-- Load and validate Big Data Bowl Week 1 tracking data (`week1.csv`, `plays.csv`, `games.csv`).
-- Normalize all plays so the offense always moves left-to-right for consistent spatial logic.
-- Implement a deterministic coverage engine in `src/coverage_assignment.py`:
-  - **Zone coverage**: Voronoi-based assignment from defender positions at the snap.
-  - **Man coverage**: Motion-correlation + distance–based assignment between snap and pass.
-- Engineer pre-snap features in `src/coverage_features.py` (cushion distance, safety depth, CB alignment, defenders in box, etc.).
-- Validate spatial and temporal correctness via notebooks:
-  - `notebooks/01_data_validation.ipynb`: data sanity checks, static plots, animations.
-  - `notebooks/02_coverage_assignment.ipynb`: coverage assignment validation and feature matrix preview.
+## What it does
 
-Planned work
-------------
+- **Zone coverage**: Voronoi spatial decomposition of defender positions at 
+  the snap — each defender's cell defines their area of responsibility
+- **Man coverage**: Frame-by-frame motion correlation between defenders and 
+  receivers between snap and pass to identify shadowing assignments
+- **Pre-snap feature engineering**: cushion distance, safety depth, CB 
+  alignment, defenders in box — used for man/zone classification (Phase 3)
 
-- Train an ML model to predict Man vs Zone (`pff_passCoverageType`) from pre-snap features.
-- Add SHAP-based explanations for coverage predictions.
-- Build a small dashboard to visualize assignments over time.
+## Current status
 
-Project structure
------------------
+Phase 1 complete, Phase 2 engine functional:
+- Data loading, normalization, and validation pipeline (`src/data_processing.py`)
+- Full visualization layer with field plots and animations (`src/visualization.py`)
+- Deterministic coverage assignment engine (`src/coverage_assignment.py`)
+- Pre-snap feature extraction (`src/coverage_features.py`)
+- Validated on 7,400+ standard passing plays from NFL Big Data Bowl 2023
 
-- `src/` – reusable Python modules for data processing, coverage assignment, features, and visualization.
-- `notebooks/` – Jupyter notebooks for validation and exploration.
-- `data/raw/` – local tracking CSVs (ignored by git; download from Big Data Bowl).
-- `requirements.txt` – pinned dependencies for Python 3.10+.
+## Planned (Phase 3+)
 
+- XGBoost classifier for man/zone prediction with SHAP explainability
+- FastAPI backend + JavaScript dashboard for interactive play visualization
+- Full dataset expansion across all 9 weeks (~85,000 plays)
+
+## How to run
+```bash
+pip install -r requirements.txt
+jupyter notebook
+```
+
+Open `notebooks/01_data_validation.ipynb` first, then
+`notebooks/02_coverage_assignment.ipynb`.
+
+Data files are not included — download from
+[NFL Big Data Bowl 2023](https://www.kaggle.com/competitions/nfl-big-data-bowl-2023/data)
+and place CSVs in `data/raw/`.
+
+## Stack
+
+Python, NumPy, SciPy, pandas, scikit-learn, Matplotlib
+
+## Project structure
+
+- `src/` — reusable modules for data processing, assignment engine,
+  features, and visualization
+- `notebooks/` — validation and exploration notebooks
+- `data/raw/` — local CSVs (gitignored)
+- `requirements.txt` — pinned dependencies for Python 3.10+
