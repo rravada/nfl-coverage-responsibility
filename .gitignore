@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_backup
+
+# Data files (local only – do not commit tracking CSVs)
+data/raw/
+data/interim/
+data/processed/
+*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# VS Code / Cursor
+.vscode/
+.cursor/
+
