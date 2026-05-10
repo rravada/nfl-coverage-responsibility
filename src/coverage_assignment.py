@@ -29,6 +29,24 @@ PASS_RUSH_POSITIONS = {'DE', 'DT'}
 COVERAGE_DEPTH_YARDS = 3.0
 
 
+def _get_xy_series(nflid, tracking_df, frames_in_range):
+    """Build a per-frame (x, y) series for one player, reindexed to frames_in_range.
+
+    Missing frames are forward/back-filled, and any remaining gaps are imputed
+    with the column mean so downstream velocity/correlation math always sees
+    a fully populated series.
+    """
+    sub = (
+        tracking_df[tracking_df['nflId'] == nflid][['frameId', 'x', 'y']]
+        .drop_duplicates('frameId')
+        .set_index('frameId')
+    )
+    sub = sub.reindex(frames_in_range).sort_index().ffill().bfill()
+    if sub.isna().any().any():
+        sub = sub.fillna(sub.mean())
+    return sub
+
+
 def get_snap_frame(tracking_df):
     """
     Find the frameId where event == "ball_snap".
@@ -305,24 +323,16 @@ def compute_man_coverage_assignment(receivers_df, defenders_df, tracking_df, sna
         out['composite_score'] = np.nan
         return out
 
-    # Build position time series per player (x, y) for frames_in_range
-    def get_xy_series(nflid):
-        sub = tracking_df[tracking_df['nflId'] == nflid][['frameId', 'x', 'y']].drop_duplicates('frameId').set_index('frameId')
-        sub = sub.reindex(frames_in_range).sort_index().ffill().bfill()
-        if sub.isna().any().any():
-            sub = sub.fillna(sub.mean())
-        return sub
-
     rec_series = {}
     for n in rec_nflids:
         try:
-            rec_series[n] = get_xy_series(n)
+            rec_series[n] = _get_xy_series(n, tracking_df, frames_in_range)
         except Exception:
             continue
     def_series = {}
     for n in def_nflids:
         try:
-            def_series[n] = get_xy_series(n)
+            def_series[n] = _get_xy_series(n, tracking_df, frames_in_range)
         except Exception:
             continue
 
@@ -459,15 +469,8 @@ def compute_man_correlation_matrix(receivers_df, defenders_df, tracking_df, snap
     rec_nflids = receivers_df['nflId'].dropna().astype(int).tolist()
     def_nflids = defenders_df['nflId'].dropna().astype(int).tolist()
 
-    def get_xy_series(nflid):
-        sub = tracking_df[tracking_df['nflId'] == nflid][['frameId', 'x', 'y']].drop_duplicates('frameId').set_index('frameId')
-        sub = sub.reindex(frames_in_range).sort_index().ffill().bfill()
-        if sub.isna().any().any():
-            sub = sub.fillna(sub.mean())
-        return sub
-
-    rec_series = {n: get_xy_series(n) for n in rec_nflids}
-    def_series = {n: get_xy_series(n) for n in def_nflids}
+    rec_series = {n: _get_xy_series(n, tracking_df, frames_in_range) for n in rec_nflids}
+    def_series = {n: _get_xy_series(n, tracking_df, frames_in_range) for n in def_nflids}
 
     def velocities(series_dict):
         out = {}
