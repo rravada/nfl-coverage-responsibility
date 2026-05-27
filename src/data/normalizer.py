@@ -636,6 +636,8 @@ def load_and_build(
     pff_path: Optional[_PathLike] = None,
     plays_path: Optional[_PathLike] = None,
     games_path: Optional[_PathLike] = None,
+    game_id: Optional[Union[int, str]] = None,
+    play_id: Optional[Union[int, str]] = None,
 ) -> pd.DataFrame:
     """
     Convenience entry-point: load all source files and run the full pipeline.
@@ -659,6 +661,16 @@ def load_and_build(
     games_path:
         Path to ``games.csv``.  Defaults to ``data/raw/games.csv``.
         Pass ``None`` explicitly to skip game-scheduling merging.
+    game_id:
+        When provided, only tracking rows whose ``gameId`` matches this value
+        are retained immediately after loading, before any downstream merges or
+        normalization.  Accepts both ``int`` and ``str`` values; comparison is
+        performed after coercing the column to the same type.  Reduces peak
+        memory when only a single game is needed.
+    play_id:
+        When provided alongside *game_id*, further restricts tracking rows to
+        those whose ``playId`` matches this value.  Ignored when *game_id* is
+        ``None`` because ``playId`` is not globally unique across games.
 
     Returns
     -------
@@ -685,12 +697,35 @@ def load_and_build(
             plays_path="data/raw/plays.csv",
             games_path="data/raw/games.csv",
         )
+
+    Isolate a single play to minimise memory overhead::
+
+        tracking = load_and_build(game_id=2022090800, play_id=97)
     """
     tracking_df = load_tracking(tracking_path)
+
+    # --- Early-filter tracking rows to reduce memory before heavy processing ---
+    if game_id is not None:
+        _gid = type(tracking_df["gameId"].iloc[0])(game_id)
+        mask = tracking_df["gameId"] == _gid
+        if play_id is not None:
+            _pid = type(tracking_df["playId"].iloc[0])(play_id)
+            mask = mask & (tracking_df["playId"] == _pid)
+        tracking_df = tracking_df.loc[mask].copy()
+
     players_df = load_players(players_path)
     pff_df = load_pff_scouting(pff_path)
     plays_df = load_plays(plays_path)
     games_df = load_games(games_path)
+
+    # --- Early-filter metadata frames on game_id to accelerate downstream merges ---
+    if game_id is not None:
+        if pff_df is not None and not pff_df.empty and "gameId" in pff_df.columns:
+            _gid_pff = type(pff_df["gameId"].iloc[0])(game_id)
+            pff_df = pff_df.loc[pff_df["gameId"] == _gid_pff].copy()
+        if plays_df is not None and not plays_df.empty and "gameId" in plays_df.columns:
+            _gid_plays = type(plays_df["gameId"].iloc[0])(game_id)
+            plays_df = plays_df.loc[plays_df["gameId"] == _gid_plays].copy()
 
     return build_normalized_tracking(
         tracking_df=tracking_df,
