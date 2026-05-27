@@ -37,20 +37,31 @@ As a user selects a play and watches the 2D animation frontend unfold, the inter
 * `app/` — FastAPI backend web service exposing optimized REST endpoints to query and serve situational tracking data.
 * `outputs/` — Target directory for serialized analytics deliverables (`matchup_matrix.parquet`, `spatial_disguise_index.parquet`, `burn_risk_log.parquet`) and performance reports.
 
+---
+
 ## Setup & Usage
 
 ### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
+```
 
 ### 2. Execute Production Training
+```bash
 python pipelines/train.py
+```
 
 ### 3. Run Pipeline Evaluation & Metric Export
+```bash
 python pipelines/evaluate.py --game-id 2021090900 --smoke-test
+```
 
 ### 4. Launch the Local Query Engine Service
+```bash
 uvicorn app.main:app --reload
+```
+
+---
 
 ## License
 
