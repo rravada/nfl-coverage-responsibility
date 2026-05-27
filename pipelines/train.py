@@ -182,6 +182,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    p.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help=(
+            "Short-circuit Optuna tuning and boosting rounds for rapid pipeline "
+            "verification: 2 Optuna trials, 2 CV folds, max 50 boosting rounds "
+            "throughout. Combine with --game-id for sub-30-second iteration."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -855,6 +864,7 @@ def optimize_hyperparameters(
     sample_weights: np.ndarray,
     num_classes: int,
     n_trials: int = 20,
+    smoke_test: bool = False,
 ) -> dict:
     """
     Run an Optuna TPE sweep over GroupKFold splits to find the best XGBoost
@@ -865,10 +875,12 @@ def optimize_hyperparameters(
     1. Iterates over all ``cv_folds`` (positional index arrays into ``X_train``).
     2. Slices fold-train / fold-validation arrays and the matching
        ``sample_weights`` slice.
-    3. Fits an :class:`xgb.XGBClassifier` with the trial's sampled parameters,
-       evaluating against the fold-validation set with ``early_stopping_rounds=30``
-       to prevent deep overfit on tracking noise.
-    4. Collects ``model.best_score`` (best out-of-fold ``mlogloss``).
+    3. Fits a native XGBoost booster via ``xgb.DMatrix`` + ``xgb.train()`` so
+       that ``num_class`` in the params dict is the sole authority on class
+       count — preventing the scikit-learn wrapper from inferring classes from
+       ``np.unique(y_fold_train)`` and crashing when a fold slice is missing a
+       minority class.
+    4. Collects the best out-of-fold ``mlogloss`` across all evaluated rounds.
 
     The average OOF ``mlogloss`` across all folds is the minimisation metric.
 
@@ -898,6 +910,9 @@ def optimize_hyperparameters(
         Total number of coverage-responsibility classes.
     n_trials : int
         Number of Optuna trials to execute (default 20).
+    smoke_test : bool
+        When ``True`` clamps the search to 2 folds and caps ``n_boost_rounds``
+        at 50 per fold, enabling sub-30-second pipeline verification runs.
 
     Returns
     -------
@@ -906,9 +921,32 @@ def optimize_hyperparameters(
     """
     import xgboost as xgb  # already guarded at module level; re-import for clarity
 
+    # Smoke-test guards: restrict fold count and trial budget before entering
+    # the study so every hot path inside objective() runs at minimal cost.
+    active_folds = cv_folds[:2] if smoke_test else cv_folds
+    _SMOKE_MAX_ROUNDS = 50
+
     def objective(trial: "optuna.Trial") -> float:  # type: ignore[name-defined]
-        trial_params = {
-            "n_estimators": trial.suggest_int("n_estimators", 200, 1500, step=100),
+        # Extract n_estimators separately — it becomes num_boost_round in the
+        # native xgb.train() API rather than a booster param key.
+        n_boost_rounds = trial.suggest_int("n_estimators", 200, 1500, step=100)
+        if smoke_test:
+            n_boost_rounds = min(n_boost_rounds, _SMOKE_MAX_ROUNDS)
+
+        # Use the native booster params dict rather than XGBClassifier so that
+        # num_class is the sole authority on class count.  XGBClassifier's
+        # sklearn wrapper infers classes from np.unique(y_fold_train), which
+        # crashes with a class-mismatch ValueError whenever a fold slice is
+        # missing one or more minority classes — common in single-game smoke
+        # tests.  xgb.DMatrix accepts integer labels verbatim; missing classes
+        # in a fold simply contribute zero training examples for that class.
+        booster_params: dict = {
+            "objective": "multi:softprob",
+            "num_class": num_classes,
+            "eval_metric": "mlogloss",
+            "tree_method": "hist",
+            "seed": RANDOM_SEED,
+            "verbosity": 0,
             "max_depth": trial.suggest_int("max_depth", 4, 8),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
             "subsample": trial.suggest_float("subsample", 0.6, 0.9),
@@ -919,32 +957,28 @@ def optimize_hyperparameters(
         }
 
         fold_scores: list[float] = []
-        for fold_train_pos, fold_val_pos in cv_folds:
-            X_fold_train = X_train[fold_train_pos]
-            y_fold_train = y_train[fold_train_pos]
-            X_fold_val = X_train[fold_val_pos]
-            y_fold_val = y_train[fold_val_pos]
-            w_fold_train = sample_weights[fold_train_pos]
+        for fold_train_pos, fold_val_pos in active_folds:
+            dtrain = xgb.DMatrix(
+                X_train[fold_train_pos],
+                label=y_train[fold_train_pos],
+                weight=sample_weights[fold_train_pos],
+            )
+            dval = xgb.DMatrix(
+                X_train[fold_val_pos],
+                label=y_train[fold_val_pos],
+            )
 
-            clf = xgb.XGBClassifier(
-                objective="multi:softprob",
-                num_class=num_classes,
-                eval_metric="mlogloss",
-                tree_method="hist",
-                random_state=RANDOM_SEED,
-                n_jobs=-1,
-                verbosity=0,
+            evals_result: dict = {}
+            xgb.train(
+                booster_params,
+                dtrain,
+                num_boost_round=n_boost_rounds,
+                evals=[(dval, "val")],
                 early_stopping_rounds=30,
-                **trial_params,
+                evals_result=evals_result,
+                verbose_eval=False,
             )
-            clf.fit(
-                X_fold_train,
-                y_fold_train,
-                sample_weight=w_fold_train,
-                eval_set=[(X_fold_val, y_fold_val)],
-                verbose=False,
-            )
-            fold_scores.append(float(clf.best_score))
+            fold_scores.append(float(min(evals_result["val"]["mlogloss"])))
 
         return float(np.mean(fold_scores))
 
@@ -953,9 +987,10 @@ def optimize_hyperparameters(
         sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
     )
     log.info(
-        "Optuna TPE study started: %d trials × %d GroupKFold folds...",
+        "Optuna TPE study started: %d trials × %d GroupKFold folds%s...",
         n_trials,
-        len(cv_folds),
+        len(active_folds),
+        " [smoke-test mode: capped at 50 rounds/fold]" if smoke_test else "",
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
@@ -1075,10 +1110,13 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
     log.info("%d GroupKFold folds ready for hyperparameter search.", len(cv_folds))
 
     # ── Step 11: Optuna hyperparameter optimization ───────────────────────────
+    n_optuna_trials = 2 if args.smoke_test else 20
     if _OPTUNA_AVAILABLE:
         log.info(
-            "Launching Optuna hyperparameter sweep: 20 trials × %d GroupKFold folds...",
-            len(cv_folds),
+            "Launching Optuna hyperparameter sweep: %d trials × %d GroupKFold folds%s...",
+            n_optuna_trials,
+            min(len(cv_folds), 2) if args.smoke_test else len(cv_folds),
+            " [smoke-test mode]" if args.smoke_test else "",
         )
         best_params = optimize_hyperparameters(
             X_train,
@@ -1086,7 +1124,8 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
             cv_folds,
             sample_weights_train,
             num_classes=len(classes),
-            n_trials=20,
+            n_trials=n_optuna_trials,
+            smoke_test=args.smoke_test,
         )
         log.info("Best hyperparameters discovered by Optuna:")
         for k, v in sorted(best_params.items()):
@@ -1100,20 +1139,53 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
         best_params = None
 
     # ── Step 12: Compile final production model with optimized parameters ─────
-    model = compile_xgboost_model(num_classes=len(classes), params=best_params)
+    # In smoke-test mode cap n_estimators at 50 so the production fit completes
+    # in seconds regardless of what Optuna sampled.
+    if args.smoke_test:
+        smoke_params = dict(best_params or {})
+        smoke_params["n_estimators"] = min(smoke_params.get("n_estimators", 500), 50)
+        model = compile_xgboost_model(num_classes=len(classes), params=smoke_params)
+        log.warning(
+            "smoke-test mode: final fit capped at n_estimators=%d.",
+            smoke_params["n_estimators"],
+        )
+    else:
+        model = compile_xgboost_model(num_classes=len(classes), params=best_params)
 
     # ── Step 13: Final production fit on full train split ─────────────────────
+    # When --game-id restricts ingestion to a single game the deterministic
+    # hash split can route 100 % of rows to X_train, leaving X_test empty.
+    # Passing an empty matrix to XGBoost's eval_set triggers a
+    # '-nan(ind)' ValueError from the metric parser.  Fall back to the first
+    # GroupKFold validation slice so smoke tests always have a valid eval set.
+    if len(X_test) > 0:
+        fit_eval_set = [(X_test, y_test)]
+        eval_label = "locked-out test set"
+    else:
+        val_fold_pos = cv_folds[0][1]
+        X_val_smoke = X_train[val_fold_pos]
+        y_val_smoke = y_train[val_fold_pos]
+        fit_eval_set = [(X_val_smoke, y_val_smoke)]
+        eval_label = "GroupKFold fold-0 validation (smoke-test fallback — X_test is empty)"
+        log.warning(
+            "X_test is empty (single-game smoke test?). "
+            "Eval set for final fit replaced with GroupKFold fold-0 "
+            "validation slice (%d rows).",
+            len(val_fold_pos),
+        )
+
     log.info(
         "Final production fit | %d train rows | %d classes | "
-        "sample_weight injected | eval against locked-out test set...",
+        "sample_weight injected | eval against %s...",
         len(X_train),
         len(classes),
+        eval_label,
     )
     model.fit(
         X_train,
         y_train,
         sample_weight=sample_weights_train,
-        eval_set=[(X_test, y_test)],
+        eval_set=fit_eval_set,
         verbose=50,
     )
 
