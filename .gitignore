@@ -27,3 +27,6 @@ Thumbs.db
 .vscode/
 .cursor/
 
+# Machine Learning Artifacts
+models/
+outputs/
