@@ -12,12 +12,19 @@ Entry point
         --model-dir models \\
         --output-dir outputs/eval
 
+    # Single-week production evaluation (week 1):
+    python pipelines/evaluate.py \\
+        --data-dir  data/raw \\
+        --model-dir models \\
+        --output-dir outputs/eval \\
+        --tracking-weeks 1
+
     # Local smoke-test (bypasses MD5 hash, forces all rows as test set):
     python pipelines/evaluate.py \\
         --data-dir  data/raw \\
         --model-dir models \\
         --output-dir outputs/smoke \\
-        --game-id 2021090900 \\
+        --game-ids 2021090900 \\
         --smoke-test
 
 Architecture
@@ -60,16 +67,27 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from src.coverage_assignment import (
     build_coverage_assignments,
     build_field_grid,
     compute_defender_territories,
 )
-from src.data.normalizer import load_and_build
+from src.data.normalizer import (
+    build_normalized_tracking,
+    load_games,
+    load_players,
+    load_plays,
+    load_pff_scouting,
+)
 from src.features.coverage_features import (
     compute_presnap_safety_depth,
     compute_receiver_cushion,
     compute_spatial_leverage,
+    compute_velocity_angular_divergence,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,16 +182,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Directory to write evaluation outputs.",
     )
     p.add_argument(
-        "--tracking-week",
+        "--tracking-weeks",
+        nargs="+",
         type=int,
-        default=1,
-        help="Tracking file week number (e.g. 1 → week1.csv).",
+        default=[1],
+        metavar="WEEK",
+        help=(
+            "One or more tracking week numbers to load "
+            "(e.g. --tracking-weeks 1 → week1.csv). "
+            "Duplicate values are silently deduplicated."
+        ),
     )
     p.add_argument(
-        "--game-id",
+        "--game-ids",
+        nargs="*",
         type=int,
         default=None,
-        help="Restrict evaluation to a single gameId (smoke-test).",
+        metavar="GAME_ID",
+        help=(
+            "Restrict evaluation to specific game IDs across the loaded weeks. "
+            "Omit entirely to evaluate all games from the specified weeks. "
+            "Example: --game-ids 2021090900 2021091300"
+        ),
     )
     p.add_argument(
         "--grid-resolution",
@@ -198,7 +228,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Force the entire ingested matrix to act as the evaluation test set, "
-            "bypassing the MD5 hash partition.  Use with --game-id for rapid local "
+            "bypassing the MD5 hash partition.  Use with --game-ids for rapid local "
             "pipeline validation when the target game routes entirely to the training "
             "split under the deterministic hash."
         ),
@@ -381,46 +411,165 @@ def split_by_game(
 
 
 # ---------------------------------------------------------------------------
+# 4.5.  Memory optimization (mirrors pipelines/train.py::_downcast_memory)
+# ---------------------------------------------------------------------------
+
+
+def _downcast_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce DataFrame memory footprint for multi-week production datasets.
+
+    Float64 spatial / kinematic columns are downcast to float32 while
+    ``nflId`` and PFF assignment ID columns are preserved at float64 (they
+    carry NaN for the ball entity and serve as merge keys).
+
+    Integer ID columns are downcast to low-overhead types:
+      * ``gameId``  → int32  (max 2,147,483,647 > any foreseeable game ID)
+      * ``playId``  → int32  (play IDs are small positive integers)
+      * ``frameId`` → int16  (per-play frames typically < 300; int16 max = 32,767)
+
+    NaN-safety: integer downcasting is skipped for any column that contains
+    NaN values, since plain NumPy integer dtypes cannot represent NaN.
+    """
+    df = df.copy()
+    _PRESERVE_FLOAT64: frozenset[str] = frozenset({
+        "nflId",
+        "pff_primaryDefensiveCoveredReceiverId",
+    })
+    for col in df.select_dtypes(include="float64").columns:
+        if col not in _PRESERVE_FLOAT64:
+            df[col] = df[col].astype(np.float32)
+
+    _INT_CASTS: dict[str, type] = {
+        "gameId":  np.int32,
+        "playId":  np.int32,
+        "frameId": np.int16,
+    }
+    for col, dtype in _INT_CASTS.items():
+        if col in df.columns and not df[col].isna().any():
+            df[col] = df[col].astype(dtype)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 5.  Data ingestion (mirrors pipelines/train.py::ingest_tracking)
 # ---------------------------------------------------------------------------
 
 
 def _ingest_tracking(
     data_dir: Path,
-    week: int,
-    game_id: Optional[int],
+    weeks: list[int],
+    game_ids: Optional[list[int]],
 ) -> pd.DataFrame:
-    """Load, merge, and spatially normalise all raw tracking + metadata CSVs."""
-    paths = {
-        "tracking": data_dir / f"week{week}.csv",
-        "players":  data_dir / "players.csv",
-        "pff":      data_dir / "pffScoutingData.csv",
-        "plays":    data_dir / "plays.csv",
-        "games":    data_dir / "games.csv",
+    """
+    Load, merge, and spatially normalise tracking data across multiple weeks.
+
+    Metadata files are loaded once and reused across all week files.  Each
+    week's tracking CSV is early-filtered on ``gameId`` before normalization
+    when *game_ids* is specified, minimizing peak memory overhead.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Directory containing all raw CSV files.
+    weeks : list[int]
+        Tracking week numbers to load (``week{w}.csv`` per entry).
+    game_ids : list[int] | None
+        When provided, only rows whose ``gameId`` appears in this list are
+        retained after loading each week CSV.  ``None`` loads all games.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated, normalized, float32-downcast tracking DataFrame.
+    """
+    static_files = {
+        "players": data_dir / "players.csv",
+        "pff":     data_dir / "pffScoutingData.csv",
+        "plays":   data_dir / "plays.csv",
+        "games":   data_dir / "games.csv",
     }
-    for label, p in paths.items():
+    for label, p in static_files.items():
         if not p.exists():
             raise FileNotFoundError(
                 f"Required data file ({label}) not found: {p}"
             )
 
-    log.info("Ingesting tracking data — week=%d  game_id_filter=%s", week, game_id)
-    df = load_and_build(
-        tracking_path=str(paths["tracking"]),
-        players_path=str(paths["players"]),
-        pff_path=str(paths["pff"]),
-        plays_path=str(paths["plays"]),
-        games_path=str(paths["games"]),
-        game_id=game_id,
-        play_id=None,
-    )
+    log.info("Loading shared metadata files from: %s", data_dir)
+    players_df = load_players(str(static_files["players"]))
+    pff_df     = load_pff_scouting(str(static_files["pff"]))
+    plays_df   = load_plays(str(static_files["plays"]))
+    games_df   = load_games(str(static_files["games"]))
+
+    frames: list[pd.DataFrame] = []
+    for week in sorted(set(weeks)):
+        tracking_path = data_dir / f"week{week}.csv"
+        if not tracking_path.exists():
+            raise FileNotFoundError(
+                f"Tracking file not found: {tracking_path}"
+            )
+
+        log.info("Reading tracking CSV — week=%d ...", week)
+        tracking_raw: pd.DataFrame = pd.read_csv(
+            str(tracking_path), low_memory=False
+        )
+
+        if game_ids:
+            gid_dtype = type(tracking_raw["gameId"].iloc[0])
+            typed_ids = [gid_dtype(g) for g in game_ids]
+            tracking_raw = tracking_raw.loc[
+                tracking_raw["gameId"].isin(typed_ids)
+            ].copy()
+            if tracking_raw.empty:
+                log.warning(
+                    "Week %d: no rows match game_ids=%s — skipping.",
+                    week, game_ids,
+                )
+                continue
+
+        week_game_ids = tracking_raw["gameId"].unique()
+        pff_week = (
+            pff_df.loc[pff_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in pff_df.columns else pff_df
+        )
+        plays_week = (
+            plays_df.loc[plays_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in plays_df.columns else plays_df
+        )
+        games_week = (
+            games_df.loc[games_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in games_df.columns else games_df
+        )
+
+        df = build_normalized_tracking(
+            tracking_df=tracking_raw,
+            players_df=players_df,
+            pff_df=pff_week,
+            plays_df=plays_week,
+            games_df=games_week,
+        )
+        log.info(
+            "Week %d normalised: shape=%s | games=%d | plays=%d",
+            week, df.shape, df["gameId"].nunique(), df["playId"].nunique(),
+        )
+        frames.append(df)
+
+    if not frames:
+        raise ValueError(
+            f"No tracking data loaded for weeks={weeks} game_ids={game_ids}. "
+            "Verify that the specified weeks and game IDs exist in the data directory."
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = _downcast_memory(combined)
     log.info(
-        "Normalised tracking shape: %s | games: %d | plays: %d",
-        df.shape,
-        df["gameId"].nunique(),
-        df["playId"].nunique(),
+        "Multi-week ingest complete: shape=%s | games=%d | plays=%d",
+        combined.shape,
+        combined["gameId"].nunique(),
+        combined["playId"].nunique(),
     )
-    return df
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +589,9 @@ def _build_feature_matrix(
 
     Uses the same sequential left-join pattern as ``pipelines/train.py`` and
     validates that all columns listed in *feature_cols* are present after
-    assembly.
+    assembly.  Includes ``territory_ratio`` (frame-normalized Voronoi share)
+    and ``velocity_angular_divergence`` (cosine similarity of defender vs
+    receiver velocity vectors) to match the expanded training feature set.
     """
     log.info("Building field grid at %.1f yd resolution...", grid_resolution)
     grid_xy = build_field_grid(resolution=grid_resolution)
@@ -493,8 +644,15 @@ def _build_feature_matrix(
     log.info("Computing pre-snap safety depth...")
     safety_df = compute_presnap_safety_depth(tracking_df)
 
+    # ── Velocity angular divergence ───────────────────────────────────────────
+    log.info("Computing velocity angular divergence...")
+    vad_df = compute_velocity_angular_divergence(tracking_df, fallback_to_nearest=True)
+    vad_df = vad_df.rename(columns={"nflId": "defender_nflId"})
+
     # ── Sequential left-join ──────────────────────────────────────────────────
     log.info("Assembling feature matrix via sequential left-joins...")
+
+    # Build up to territory first so territory_ratio can be derived in-place.
     feature_df = (
         kine_df
         .merge(
@@ -509,6 +667,22 @@ def _build_feature_matrix(
             on=_DEFENDER_KEY,
             how="left",
         )
+    )
+
+    # Territory ratio: vectorized groupby transform — no loop required.
+    _frame_total = (
+        feature_df
+        .groupby(_FRAME_KEY)["territory_area_sq_yd"]
+        .transform("sum")
+    )
+    feature_df["territory_ratio"] = np.where(
+        _frame_total > 0,
+        feature_df["territory_area_sq_yd"] / _frame_total,
+        np.nan,
+    )
+
+    feature_df = (
+        feature_df
         .merge(
             cushion_df[_DEFENDER_KEY + ["receiver_cushion"]],
             on=_DEFENDER_KEY,
@@ -516,6 +690,11 @@ def _build_feature_matrix(
         )
         .merge(
             leverage_df[_DEFENDER_KEY + ["leverage_x", "leverage_y"]],
+            on=_DEFENDER_KEY,
+            how="left",
+        )
+        .merge(
+            vad_df[_DEFENDER_KEY + ["velocity_angular_divergence"]],
             on=_DEFENDER_KEY,
             how="left",
         )
@@ -615,8 +794,8 @@ def _fill_feature_nans(
 
 def build_test_arrays(
     data_dir: Path,
-    tracking_week: int,
-    game_id: Optional[int],
+    tracking_weeks: list[int],
+    game_ids: Optional[list[int]],
     grid_resolution: float,
     feature_cols: list[str],
     smoke_test: bool = False,
@@ -630,6 +809,10 @@ def build_test_arrays(
 
     Parameters
     ----------
+    tracking_weeks : list[int]
+        Week numbers to load (e.g. ``[1]``).
+    game_ids : list[int] | None
+        Restrict to specific game IDs; ``None`` loads all games.
     smoke_test : When ``True``, the hash split is bypassed and every ingested
                  row is treated as the test set.  See ``split_by_game`` for the
                  full contract.
@@ -641,7 +824,7 @@ def build_test_arrays(
     X_test      : np.ndarray    shape ``(n_test, n_features)`` float32 array
                                 aligned row-by-row with *test_df*
     """
-    tracking_df = _ingest_tracking(data_dir, tracking_week, game_id)
+    tracking_df = _ingest_tracking(data_dir, tracking_weeks, game_ids)
     feature_df = _build_feature_matrix(tracking_df, grid_resolution, feature_cols)
     feature_df = _build_target_labels(feature_df, tracking_df)
     feature_df = _fill_feature_nans(feature_df, feature_cols)
@@ -855,20 +1038,22 @@ def compute_spatial_disguise_index(
     else:
         voronoi_shap_signal = np.zeros(len(test_df), dtype=np.float64)
 
-    # Build snap-frame lookup: (gameId, playId) → snap frameId
+    # Build snap-frame lookup: (gameId, playId) → snap frameId (vectorized merge,
+    # avoids per-row dict lookup that is fragile with int32/int16 downcast key types).
     snap_rows = tracking_df[tracking_df["event"] == SNAP_EVENT]
-    snap_lookup: dict[tuple, int] = {}
-    for (gid, pid), grp in snap_rows.groupby(["gameId", "playId"]):
-        snap_lookup[(gid, pid)] = int(grp["frameId"].iloc[0])
+    snap_fids: pd.DataFrame = (
+        snap_rows
+        .groupby(["gameId", "playId"])["frameId"]
+        .first()
+        .rename("snap_frameId")
+        .reset_index()
+    )
 
     # Construct working DataFrame aligned to test_df
     work = test_df[["gameId", "playId", "frameId", "defender_nflId"]].copy()
     work = work.reset_index(drop=True)
     work["voronoi_shap_signal"] = voronoi_shap_signal
-    work["snap_frameId"] = work.apply(
-        lambda r: snap_lookup.get((r["gameId"], r["playId"]), np.nan),
-        axis=1,
-    )
+    work = work.merge(snap_fids, on=["gameId", "playId"], how="left")
 
     # Snap-frame SHAP baseline per (gameId, playId, defender_nflId)
     snap_mask = work["frameId"] == work["snap_frameId"]
@@ -1080,16 +1265,14 @@ def compute_burn_risk(
         how="inner",
     )
 
-    def _failure_type(row: pd.Series) -> str:
-        if row["is_cushion_failure"] and row["is_territory_failure"]:
-            return "cushion_and_territory"
-        if row["is_cushion_failure"]:
-            return "cushion_collapse"
-        return "territory_discipline"
-
     first_frame_details = first_frame_details.copy()
-    first_frame_details["failure_type"] = first_frame_details.apply(
-        _failure_type, axis=1
+    first_frame_details["failure_type"] = np.select(
+        [
+            first_frame_details["is_cushion_failure"] & first_frame_details["is_territory_failure"],
+            first_frame_details["is_cushion_failure"],
+        ],
+        ["cushion_and_territory", "cushion_collapse"],
+        default="territory_discipline",
     )
 
     # Peak signal magnitudes across all flagged frames per triple
@@ -1099,12 +1282,12 @@ def compute_burn_risk(
         .agg(
             max_cushion_decay=(
                 "cushion_delta",
-                lambda x: float(x.dropna().abs().max()) if x.dropna().shape[0] > 0 else 0.0,
+                lambda x: float(x.dropna().abs().max()) if x.notna().any() else 0.0,
             ),
             max_prob_surge=("man_proba", "max"),
             max_territory_collapse=(
                 "territory_ratio",
-                lambda x: float(x.dropna().abs().max()) if x.dropna().shape[0] > 0 else 0.0,
+                lambda x: float(x.dropna().abs().max()) if x.notna().any() else 0.0,
             ),
         )
         .reset_index()
@@ -1294,8 +1477,8 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
     # ── Step 2: Rebuild feature matrix and isolate the locked-out test split ──
     test_df, tracking_df, X_test = build_test_arrays(
         data_dir=args.data_dir,
-        tracking_week=args.tracking_week,
-        game_id=args.game_id,
+        tracking_weeks=args.tracking_weeks,
+        game_ids=args.game_ids,
         grid_resolution=args.grid_resolution,
         feature_cols=feature_cols,
         smoke_test=args.smoke_test,
@@ -1306,8 +1489,8 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
             "The test set is empty — every game in the dataset was routed to "
             "the training split by the MD5 hash.  To force local validation on "
             "a specific game, re-run with --smoke-test (e.g. "
-            "--game-id 2021090900 --smoke-test).  To use production held-out "
-            "data, remove --game-id so all weeks are ingested.",
+            "--game-ids 2021090900 --smoke-test).  To use production held-out "
+            "data, remove --game-ids so all weeks are ingested.",
         )
         return
 

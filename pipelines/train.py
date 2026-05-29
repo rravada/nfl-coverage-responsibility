@@ -5,18 +5,32 @@ Production training pipeline for the NFL Coverage Responsibility multi-class mod
 
 Entry point
 -----------
+    # Single-week baseline run:
     python pipelines/train.py --data-dir data/raw --output-dir models/
+
+    # Single-week production load (week 1, all games):
+    python pipelines/train.py --data-dir data/raw --tracking-weeks 1
+
+    # Target specific games within week 1:
+    python pipelines/train.py --data-dir data/raw --tracking-weeks 1 \\
+        --game-ids 2021090900 2021091300
+
+    # Pin hyperparameters after Optuna sweep (override specific axes):
+    python pipelines/train.py --data-dir data/raw --tracking-weeks 1 \\
+        --max-depth 5 --eta 0.03 --subsample 0.75
 
 Architecture
 ------------
 The feature matrix is **defender-centric**: one row per (gameId, playId, frameId,
 defender_nflId).  Feature families assembled here:
 
-  * Kinematic state       – x, y, s, a, o_rad, dir_rad  (from normalizer)
-  * Receiver cushion      – Euclidean distance to assigned/nearest receiver
-  * Spatial leverage      – signed x/y offset to receiver
-  * Voronoi territory     – kinematic territory area and grid-point count
-  * Pre-snap safety depth – play-level mean/std of safety depth behind LOS
+  * Kinematic state            – x, y, s, a, o_rad, dir_rad  (from normalizer)
+  * Receiver cushion           – Euclidean distance to assigned/nearest receiver
+  * Spatial leverage           – signed x/y offset to receiver
+  * Voronoi territory          – kinematic territory area and grid-point count
+  * Pre-snap safety depth      – play-level mean/std of safety depth behind LOS
+  * Velocity angular divergence– cosine similarity of defender vs receiver velocity vectors
+  * Territory ratio            – defender's Voronoi area / total defensive backfield area
 
 Leakage-prevention contract
 ----------------------------
@@ -48,6 +62,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Reconfigure stdout/stderr to UTF-8 so log messages containing Unicode arrows
+# (→) do not raise UnicodeEncodeError on Windows CP-1252 terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
@@ -62,16 +83,27 @@ try:
 except ImportError:
     _OPTUNA_AVAILABLE = False
 
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from src.coverage_assignment import (
     build_coverage_assignments,
     build_field_grid,
     compute_defender_territories,
 )
-from src.data.normalizer import load_and_build
+from src.data.normalizer import (
+    build_normalized_tracking,
+    load_games,
+    load_players,
+    load_plays,
+    load_pff_scouting,
+)
 from src.features.coverage_features import (
     compute_presnap_safety_depth,
     compute_receiver_cushion,
     compute_spatial_leverage,
+    compute_velocity_angular_divergence,
 )
 
 # ---------------------------------------------------------------------------
@@ -111,6 +143,10 @@ FEATURE_COLUMNS: list[str] = [
     # Pre-snap context (play-level, broadcast to all frames of the play)
     "safety_depth_mean",
     "safety_depth_std",
+    # Velocity alignment: cosine similarity of defender vs receiver velocity vectors
+    "velocity_angular_divergence",
+    # Territorial share: defender's Voronoi area / total defensive backfield area
+    "territory_ratio",
 ]
 
 TARGET_COLUMN: str = "coverage_label"
@@ -153,16 +189,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Directory to write trained model artifacts.",
     )
     p.add_argument(
-        "--tracking-week",
+        "--tracking-weeks",
+        nargs="+",
         type=int,
-        default=1,
-        help="Tracking file week number (e.g. 1 → week1.csv).",
+        default=[1],
+        metavar="WEEK",
+        help=(
+            "One or more tracking week numbers to load "
+            "(e.g. --tracking-weeks 1 → week1.csv). "
+            "Duplicate values are silently deduplicated."
+        ),
     )
     p.add_argument(
-        "--game-id",
+        "--game-ids",
+        nargs="*",
         type=int,
         default=None,
-        help="Restrict ingestion to a single gameId (useful for smoke-tests).",
+        metavar="GAME_ID",
+        help=(
+            "Restrict ingestion to specific game IDs across the loaded weeks. "
+            "Omit entirely to load all games from the specified weeks. "
+            "Example: --game-ids 2021090900 2021091300"
+        ),
     )
     p.add_argument(
         "--grid-resolution",
@@ -176,6 +224,40 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=5,
         help="Number of GroupKFold folds for cross-validation.",
     )
+    # ── XGBoost hyperparameter override hooks ────────────────────────────────
+    # When provided, these values are applied on top of the Optuna best_params,
+    # enabling targeted manual tuning above the 76.64 % accuracy baseline.
+    p.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Pin XGBoost max_depth (overrides Optuna choice; typical range 4–8).",
+    )
+    p.add_argument(
+        "--subsample",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Pin XGBoost subsample in (0, 1] (overrides Optuna choice).",
+    )
+    p.add_argument(
+        "--colsample-bytree",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Pin XGBoost colsample_bytree in (0, 1] (overrides Optuna choice).",
+    )
+    p.add_argument(
+        "--eta",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Pin XGBoost learning_rate (eta) in (0, 1] (overrides Optuna choice). "
+            "Lower values require more n_estimators; 0.03–0.05 suits production runs."
+        ),
+    )
     p.add_argument(
         "--log-level",
         default="INFO",
@@ -187,8 +269,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Short-circuit Optuna tuning and boosting rounds for rapid pipeline "
-            "verification: 2 Optuna trials, 2 CV folds, max 50 boosting rounds "
-            "throughout. Combine with --game-id for sub-30-second iteration."
+            "verification: 2 Optuna trials, 2 CV folds, max 50 boosting rounds. "
+            "Combine with --game-ids for sub-30-second iteration."
         ),
     )
     return p.parse_args(argv)
@@ -209,43 +291,188 @@ def setup_logging(level: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2.5. Memory optimization
+# ---------------------------------------------------------------------------
+
+
+def _downcast_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce DataFrame memory footprint for multi-week production datasets.
+
+    Strategy
+    --------
+    Float64 spatial / kinematic columns are downcast to float32, halving
+    per-column memory while preserving all physically meaningful precision
+    (NGS tracking coordinates are accurate to ~0.01 yd, well within float32
+    range of ~7 significant decimal digits).
+
+    ``nflId`` and PFF assignment ID columns are preserved at float64 because
+    they carry NaN (ball entity) and participate as merge keys.
+
+    Integer ID columns are downcast to low-overhead types:
+      * ``gameId``  → int32  (max 2,147,483,647 > any foreseeable game ID)
+      * ``playId``  → int32  (play IDs are small positive integers)
+      * ``frameId`` → int16  (per-play frames typically < 300; int16 max = 32,767)
+
+    NaN-safety: integer downcasting is skipped for any column that contains
+    NaN values, since pandas integer dtypes require explicit nullable
+    Int32/Int16 — using the plain NumPy dtype would raise a ValueError.
+    """
+    df = df.copy()
+    _PRESERVE_FLOAT64: frozenset[str] = frozenset({
+        "nflId",
+        "pff_primaryDefensiveCoveredReceiverId",
+    })
+    for col in df.select_dtypes(include="float64").columns:
+        if col not in _PRESERVE_FLOAT64:
+            df[col] = df[col].astype(np.float32)
+
+    _INT_CASTS: dict[str, type] = {
+        "gameId":  np.int32,
+        "playId":  np.int32,
+        "frameId": np.int16,
+    }
+    for col, dtype in _INT_CASTS.items():
+        if col in df.columns and not df[col].isna().any():
+            df[col] = df[col].astype(dtype)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 3. Data ingestion
 # ---------------------------------------------------------------------------
 
 
 def ingest_tracking(
     data_dir: Path,
-    week: int,
-    game_id: Optional[int],
+    weeks: list[int],
+    game_ids: Optional[list[int]],
 ) -> pd.DataFrame:
-    """Load, merge, and spatially normalize all raw tracking + metadata CSVs."""
-    tracking_path = data_dir / f"week{week}.csv"
-    players_path = data_dir / "players.csv"
-    pff_path = data_dir / "pffScoutingData.csv"
-    plays_path = data_dir / "plays.csv"
-    games_path = data_dir / "games.csv"
+    """
+    Load, merge, and spatially normalize tracking data across multiple weeks.
 
-    for p in (tracking_path, players_path, pff_path, plays_path, games_path):
+    Metadata files (``players.csv``, ``pffScoutingData.csv``, ``plays.csv``,
+    ``games.csv``) are loaded **once** and reused across all week files to
+    avoid redundant I/O.  Each week's tracking CSV is early-filtered on
+    ``gameId`` before normalization to minimize peak memory when
+    ``game_ids`` is specified.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Directory containing all raw CSV files.
+    weeks : list[int]
+        Tracking week numbers to load.  Each integer ``w`` maps to the file
+        ``week{w}.csv`` in *data_dir*.  Duplicates are silently removed.
+    game_ids : list[int] | None
+        When provided, only rows whose ``gameId`` appears in this list are
+        retained immediately after loading each week CSV (before expensive
+        normalization).  ``None`` loads every game from every requested week.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated, normalized, float32-downcast tracking DataFrame covering
+        all requested weeks and game IDs.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any required static file or requested week CSV is absent.
+    ValueError
+        If the final concatenated DataFrame is empty (no rows matched the
+        requested weeks / game IDs combination).
+    """
+    static_files = {
+        "players": data_dir / "players.csv",
+        "pff":     data_dir / "pffScoutingData.csv",
+        "plays":   data_dir / "plays.csv",
+        "games":   data_dir / "games.csv",
+    }
+    for label, p in static_files.items():
         if not p.exists():
-            raise FileNotFoundError(f"Required data file not found: {p}")
+            raise FileNotFoundError(
+                f"Required data file ({label}) not found: {p}"
+            )
 
+    log.info("Loading shared metadata files from: %s", data_dir)
+    players_df = load_players(str(static_files["players"]))
+    pff_df     = load_pff_scouting(str(static_files["pff"]))
+    plays_df   = load_plays(str(static_files["plays"]))
+    games_df   = load_games(str(static_files["games"]))
+
+    frames: list[pd.DataFrame] = []
+    for week in sorted(set(weeks)):
+        tracking_path = data_dir / f"week{week}.csv"
+        if not tracking_path.exists():
+            raise FileNotFoundError(
+                f"Tracking file not found: {tracking_path}"
+            )
+
+        log.info("Reading tracking CSV — week=%d ...", week)
+        tracking_raw: pd.DataFrame = pd.read_csv(
+            str(tracking_path), low_memory=False
+        )
+
+        # Early game-ID filter before the expensive normalization pass.
+        if game_ids:
+            gid_dtype = type(tracking_raw["gameId"].iloc[0])
+            typed_ids = [gid_dtype(g) for g in game_ids]
+            tracking_raw = tracking_raw.loc[
+                tracking_raw["gameId"].isin(typed_ids)
+            ].copy()
+            if tracking_raw.empty:
+                log.warning(
+                    "Week %d: no rows match game_ids=%s — skipping.",
+                    week, game_ids,
+                )
+                continue
+
+        # Restrict metadata joins to the games present in this week's slice
+        # to keep per-week merge tables compact.
+        week_game_ids = tracking_raw["gameId"].unique()
+        pff_week = (
+            pff_df.loc[pff_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in pff_df.columns else pff_df
+        )
+        plays_week = (
+            plays_df.loc[plays_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in plays_df.columns else plays_df
+        )
+        games_week = (
+            games_df.loc[games_df["gameId"].isin(week_game_ids)].copy()
+            if "gameId" in games_df.columns else games_df
+        )
+
+        df = build_normalized_tracking(
+            tracking_df=tracking_raw,
+            players_df=players_df,
+            pff_df=pff_week,
+            plays_df=plays_week,
+            games_df=games_week,
+        )
+        log.info(
+            "Week %d normalized: shape=%s | games=%d | plays=%d",
+            week, df.shape, df["gameId"].nunique(), df["playId"].nunique(),
+        )
+        frames.append(df)
+
+    if not frames:
+        raise ValueError(
+            f"No tracking data loaded for weeks={weeks} game_ids={game_ids}. "
+            "Verify that the specified weeks and game IDs exist in the data directory."
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = _downcast_memory(combined)
     log.info(
-        "Ingesting tracking data — week=%d, game_id_filter=%s", week, game_id
+        "Multi-week ingest complete: shape=%s | games=%d | plays=%d",
+        combined.shape,
+        combined["gameId"].nunique(),
+        combined["playId"].nunique(),
     )
-    df = load_and_build(
-        tracking_path=str(tracking_path),
-        players_path=str(players_path),
-        pff_path=str(pff_path),
-        plays_path=str(plays_path),
-        games_path=str(games_path),
-        game_id=game_id,
-        play_id=None,
-    )
-    log.info("Normalized tracking shape: %s | games: %d | plays: %d",
-             df.shape,
-             df["gameId"].nunique(),
-             df["playId"].nunique())
-    return df
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +496,13 @@ def build_feature_matrix(
        when a defender covers multiple receivers (rare), keep the first
        assignment per (frame, defender) to maintain row uniqueness.
     3. Voronoi territory metrics – territory_area_sq_yd, territory_grid_points.
+    3a. territory_ratio – vectorized groupby transform: each defender's
+        territory_area_sq_yd divided by the per-frame total defensive area.
     4. Receiver cushion   – Euclidean distance to assigned/nearest receiver.
     5. Spatial leverage   – signed (x, y) offset to assigned/nearest receiver.
-    6. Pre-snap safety depth – play-level stats broadcast to every frame.
+    6. Velocity angular divergence – cosine similarity of defender vs receiver
+       velocity vectors; computed via a vectorized merge, not a loop.
+    7. Pre-snap safety depth – play-level stats broadcast to every frame.
     """
     log.info("Building field grid at %.1f yd resolution...", grid_resolution)
     grid_xy = build_field_grid(resolution=grid_resolution)
@@ -329,8 +560,16 @@ def build_feature_matrix(
     log.info("Computing pre-snap safety depth...")
     safety_df = compute_presnap_safety_depth(tracking_df)
 
-    # ── 4g. Sequential left-join onto kinematic base ──────────────────────────
+    # ── 4g. Velocity angular divergence ──────────────────────────────────────
+    log.info("Computing velocity angular divergence...")
+    vad_df = compute_velocity_angular_divergence(tracking_df, fallback_to_nearest=True)
+    vad_df = vad_df.rename(columns={"nflId": "defender_nflId"})
+
+    # ── 4h. Sequential left-join onto kinematic base ──────────────────────────
     log.info("Assembling feature matrix via sequential left-joins...")
+
+    # Build the frame up to territory so territory_ratio can be derived
+    # before the remaining merges continue.
     feature_df = (
         kine_df
         .merge(
@@ -345,6 +584,25 @@ def build_feature_matrix(
             on=_DEFENDER_KEY,
             how="left",
         )
+    )
+
+    # ── 4h-i. Territory ratio (vectorized groupby transform, no loop) ─────────
+    # Each defender's Voronoi area divided by the total defensive backfield
+    # spatial area for that (gameId, playId, frameId).  Frames where the total
+    # is zero (all defenders lost territory, a data artifact) receive NaN.
+    _frame_total = (
+        feature_df
+        .groupby(_FRAME_KEY)["territory_area_sq_yd"]
+        .transform("sum")
+    )
+    feature_df["territory_ratio"] = np.where(
+        _frame_total > 0,
+        feature_df["territory_area_sq_yd"] / _frame_total,
+        np.nan,
+    )
+
+    feature_df = (
+        feature_df
         .merge(
             cushion_df[_DEFENDER_KEY + ["receiver_cushion"]],
             on=_DEFENDER_KEY,
@@ -352,6 +610,11 @@ def build_feature_matrix(
         )
         .merge(
             leverage_df[_DEFENDER_KEY + ["leverage_x", "leverage_y"]],
+            on=_DEFENDER_KEY,
+            how="left",
+        )
+        .merge(
+            vad_df[_DEFENDER_KEY + ["velocity_angular_divergence"]],
             on=_DEFENDER_KEY,
             how="left",
         )
@@ -590,40 +853,51 @@ def split_by_game(
 
 
 def build_group_kfold_splits(
-    feature_df: pd.DataFrame,
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
     n_splits: int = 5,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Build GroupKFold cross-validation splits keyed on composite
-    ``gameId_playId``.
+    Build GroupKFold cross-validation splits keyed on a pre-computed
+    ``groups`` array (``gameId_playId`` composite key).
 
-    Each fold guarantees zero play overlap between its inner train and
-    validation subsets — suitable for hyperparameter search with Optuna or
-    GridSearchCV without risk of intra-play correlation.
+    Alignment guarantee
+    -------------------
+    The caller must derive *X*, *y*, and *groups* from the **same** ordered
+    row subset so that positional indices returned by ``GroupKFold.split``
+    index correctly into each array.  The recommended pattern is::
+
+        train_groups = (
+            feature_df.loc[train_idx, "gameId"].astype(str)
+            + "_"
+            + feature_df.loc[train_idx, "playId"].astype(str)
+        ).values
+
+        cv_folds = build_group_kfold_splits(X_train, y_train, train_groups)
+
+    Passing the arrays directly (rather than deriving them inside this
+    function) removes the reset-index indirection that previously introduced
+    a potential misalignment between fold positional indices and ``X_train``
+    row positions.
 
     Parameters
     ----------
-    feature_df : pd.DataFrame
-        Must contain TARGET_COLUMN and all FEATURE_COLUMNS.
-        Typically the training-set slice (feature_df.loc[train_idx]).
+    X : np.ndarray, shape (n_train, n_features)
+        Feature matrix for the training split.
+    y : np.ndarray, shape (n_train,)
+        Encoded label array for the training split.
+    groups : np.ndarray, shape (n_train,)
+        Per-row group label (typically ``"<gameId>_<playId>"``); rows
+        sharing a label are always assigned to the same fold.
     n_splits : int
-        Number of folds.
+        Number of folds.  Must be ≤ the number of unique groups.
 
     Returns
     -------
-    List of (train_positions, val_positions) index arrays (positional into
-    the passed feature_df).
+    list of (fold_train_pos, fold_val_pos) positional index pairs, where
+    each index is a 1-D integer array into *X* / *y* / *groups*.
     """
-    df = feature_df.copy()
-    df[GROUP_COLUMN] = (
-        df["gameId"].astype(str) + "_" + df["playId"].astype(str)
-    )
-
-    available_features = [c for c in FEATURE_COLUMNS if c in df.columns]
-    X = df[available_features].values
-    y = df[TARGET_COLUMN].values
-    groups = df[GROUP_COLUMN].values
-
     gkf = GroupKFold(n_splits=n_splits)
     folds = list(gkf.split(X, y, groups=groups))
 
@@ -756,17 +1030,31 @@ def compute_sample_weights(
     sample_weights : np.ndarray of shape (n_samples,)
         One weight per training row.
     """
-    class_weights: np.ndarray = compute_class_weight(
+    # Only compute balanced weights for classes that actually appear in the
+    # training split.  After a game-level train/test split some player IDs may
+    # exist only in test games, so passing the full np.arange(len(le.classes_))
+    # to sklearn's compute_class_weight would raise
+    # "classes should have valid labels that are in y".
+    observed_classes = np.unique(y_encoded)
+    observed_weights: np.ndarray = compute_class_weight(
         class_weight="balanced",
-        classes=np.arange(len(le.classes_)),
+        classes=observed_classes,
         y=y_encoded,
     )
 
+    # Build a full-length weight array; classes absent from the training set
+    # receive a neutral weight of 1.0 (they will never appear in y_encoded so
+    # the value is never used, but the array must cover all le.classes_ indices
+    # for the class_weights[y_encoded] indexing below to remain valid).
+    class_weights = np.ones(len(le.classes_), dtype=np.float64)
+    class_weights[observed_classes] = observed_weights
+
     zone_idx = int(np.where(le.classes_ == LABEL_ZONE)[0][0])
     log.info(
-        "Balanced class weights computed: %d classes | "
+        "Balanced class weights computed: %d observed classes (%d total) | "
         "'%s' (idx=%d) weight=%.6f | "
         "min weight=%.6f | max weight=%.6f",
+        len(observed_classes),
         len(le.classes_),
         LABEL_ZONE,
         zone_idx,
@@ -1059,7 +1347,7 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Step 1: Ingest & normalize ───────────────────────────────────────────
-    tracking_df = ingest_tracking(args.data_dir, args.tracking_week, args.game_id)
+    tracking_df = ingest_tracking(args.data_dir, args.tracking_weeks, args.game_ids)
 
     # ── Step 2: Assemble defender-centric feature matrix ─────────────────────
     feature_df = build_feature_matrix(tracking_df, args.grid_resolution)
@@ -1103,8 +1391,20 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
     sample_weights_train = compute_sample_weights(y_train, le)
 
     # ── Step 10: GroupKFold splits for cross-validation / Optuna sweeps ──────
+    # Derive group keys directly from the training-slice rows in the *same
+    # positional order* as X_train, so that fold_train_pos / fold_val_pos
+    # returned by GroupKFold.split() are valid positional indices into X_train
+    # and y_train with zero ambiguity.  Using the arrays themselves (not a
+    # reset-indexed DataFrame copy) eliminates the index-alignment indirection.
+    train_groups: np.ndarray = (
+        feature_df.loc[train_idx, "gameId"].astype(str)
+        + "_"
+        + feature_df.loc[train_idx, "playId"].astype(str)
+    ).values
     cv_folds = build_group_kfold_splits(
-        feature_df.loc[train_idx].reset_index(drop=True),
+        X_train,
+        y_train,
+        groups=train_groups,
         n_splits=args.n_splits,
     )
     log.info("%d GroupKFold folds ready for hyperparameter search.", len(cv_folds))
@@ -1137,6 +1437,27 @@ def main(argv: Optional[list[str]] = None) -> None:  # noqa: PLR0915
             "Proceeding with baseline XGBoost hyperparameters."
         )
         best_params = None
+
+    # ── Step 11.5: Apply CLI hyperparameter pin overrides ────────────────────
+    # Any explicitly-provided CLI hyperparameter takes precedence over the
+    # Optuna-discovered value for that axis, enabling targeted manual tuning
+    # without re-running the full sweep.  Unspecified axes retain the Optuna
+    # (or baseline default) value unchanged.
+    cli_hp: dict = {}
+    if args.max_depth is not None:
+        cli_hp["max_depth"] = args.max_depth
+    if args.subsample is not None:
+        cli_hp["subsample"] = args.subsample
+    if args.colsample_bytree is not None:
+        cli_hp["colsample_bytree"] = args.colsample_bytree
+    if args.eta is not None:
+        cli_hp["learning_rate"] = args.eta  # map --eta → learning_rate key
+    if cli_hp:
+        best_params = dict(best_params or {})
+        best_params.update(cli_hp)
+        log.info(
+            "CLI hyperparameter pin(s) applied over Optuna result: %s", cli_hp
+        )
 
     # ── Step 12: Compile final production model with optimized parameters ─────
     # In smoke-test mode cap n_estimators at 50 so the production fit completes

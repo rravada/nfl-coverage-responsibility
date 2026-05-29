@@ -875,17 +875,15 @@ def build_coverage_assignments(
         assignments = build_coverage_assignments(tracking)
         print(assignments.head(10))
 
-    Reuse a pre-built grid across multiple calls::
+    Reuse a pre-built grid (e.g. across multiple function calls)::
 
         from src.coverage_assignment import build_field_grid, build_coverage_assignments
 
         grid = build_field_grid(resolution=0.5)
 
         week1 = load_and_build(tracking_path="data/raw/week1.csv", ...)
-        week2 = load_and_build(tracking_path="data/raw/week2.csv", ...)
 
         a1 = build_coverage_assignments(week1, grid_xy=grid)
-        a2 = build_coverage_assignments(week2, grid_xy=grid)
     """
     missing_cols: frozenset[str] = _REQUIRED_COLS - frozenset(tracking_df.columns)
     if missing_cols:

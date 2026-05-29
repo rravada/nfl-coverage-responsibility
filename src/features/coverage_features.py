@@ -78,11 +78,13 @@ Usage
         compute_receiver_cushion,
         compute_spatial_leverage,
         compute_presnap_safety_depth,
+        compute_velocity_angular_divergence,
     )
 
     cushion  = compute_receiver_cushion(tracking_df)
     leverage = compute_spatial_leverage(tracking_df)
     depth    = compute_presnap_safety_depth(tracking_df)
+    vad      = compute_velocity_angular_divergence(tracking_df)
 """
 
 from __future__ import annotations
@@ -782,65 +784,239 @@ def compute_presnap_safety_depth(
     """
     df: pd.DataFrame = tracking_df.copy()
 
-    records: list[dict] = []
+    # ── Step 1: Identify the snap frameId per (gameId, playId) ───────────────
+    # Minimum frameId where event == SNAP_EVENT matches the original
+    # `iloc[0]` first-occurrence semantics (plays are time-ordered).
+    snap_frame_map: pd.DataFrame = (
+        df[df["event"] == SNAP_EVENT]
+        .groupby(["gameId", "playId"])["frameId"]
+        .min()
+        .rename("snap_frameId")
+        .reset_index()
+    )
 
-    for (game_id, play_id), play_group in df.groupby(["gameId", "playId"]):
-        # Locate the snap event frame.
-        snap_rows: pd.DataFrame = play_group[play_group["event"] == SNAP_EVENT]
-
-        if snap_rows.empty:
-            records.append(
-                {
-                    "gameId": game_id,
-                    "playId": play_id,
-                    "los_x": np.nan,
-                    "safety_depth_mean": np.nan,
-                    "safety_depth_std": np.nan,
-                    "n_safety_frames": 0,
-                }
-            )
-            continue
-
-        snap_frame_id: int = int(snap_rows["frameId"].iloc[0])
-
-        # Resolve LOS X from the ball entity or absoluteYardlineNumber.
-        los_x: float = _resolve_los_x(play_group, snap_frame_id)
-
-        # Collect all pre-snap frames (up to and including the snap).
-        presnap: pd.DataFrame = play_group[play_group["frameId"] <= snap_frame_id]
-
-        # Filter to safeties.
-        safeties: pd.DataFrame = presnap[
-            presnap["officialPosition"].isin(SAFETY_POSITIONS)
-        ]
-
-        if safeties.empty:
-            records.append(
-                {
-                    "gameId": game_id,
-                    "playId": play_id,
-                    "los_x": los_x,
-                    "safety_depth_mean": np.nan,
-                    "safety_depth_std": np.nan,
-                    "n_safety_frames": 0,
-                }
-            )
-            continue
-
-        depths: np.ndarray = safeties["x"].to_numpy(dtype=np.float64) - los_x
-        n: int = int(len(depths))
-
-        records.append(
-            {
-                "gameId": game_id,
-                "playId": play_id,
-                "los_x": los_x,
-                "safety_depth_mean": float(np.mean(depths)),
-                "safety_depth_std": (
-                    float(np.std(depths, ddof=1)) if n > 1 else np.nan
-                ),
-                "n_safety_frames": n,
-            }
+    if snap_frame_map.empty:
+        return pd.DataFrame(
+            columns=[
+                "gameId", "playId", "los_x",
+                "safety_depth_mean", "safety_depth_std", "n_safety_frames",
+            ]
         )
 
-    return pd.DataFrame(records)
+    # ── Step 2: Resolve LOS X from the ball entity at the snap frame ─────────
+    # The ball entity (officialPosition == "BALL") is always at the snap frame;
+    # `.first()` safely handles the rare edge case of multiple ball rows.
+    ball_los: pd.DataFrame = (
+        df[
+            (df["officialPosition"] == _BALL_SENTINEL)
+            & (df["event"] == SNAP_EVENT)
+        ]
+        .groupby(["gameId", "playId"])["x"]
+        .first()
+        .rename("los_x_ball")
+        .reset_index()
+    )
+
+    # ── Step 3: Assemble play-level metadata (snap frameId + LOS X) ──────────
+    play_info: pd.DataFrame = snap_frame_map.merge(
+        ball_los, on=["gameId", "playId"], how="left"
+    )
+
+    # Fallback LOS from absoluteYardlineNumber when ball-entity tracking is absent.
+    if SCRIMMAGE_X_COL in df.columns:
+        yard_src = (
+            df[["gameId", "playId", SCRIMMAGE_X_COL]]
+            .dropna(subset=[SCRIMMAGE_X_COL])
+            .drop_duplicates(subset=["gameId", "playId"])
+            .copy()
+        )
+        yard_src["los_x_yard"] = yard_src[SCRIMMAGE_X_COL] + _ENDZONE_DEPTH
+        yard_los: pd.DataFrame = yard_src[["gameId", "playId", "los_x_yard"]]
+        play_info = play_info.merge(yard_los, on=["gameId", "playId"], how="left")
+        play_info["los_x"] = play_info["los_x_ball"].combine_first(
+            play_info["los_x_yard"]
+        )
+        play_info = play_info.drop(columns=["los_x_ball", "los_x_yard"])
+    else:
+        play_info = play_info.rename(columns={"los_x_ball": "los_x"})
+
+    # ── Step 4: Broadcast snap_frameId and los_x to all tracking rows ─────────
+    # Left join preserves every tracking row; plays without snap events receive
+    # NaN snap_frameId, which the boolean mask below excludes cleanly.
+    merged: pd.DataFrame = df.merge(
+        play_info[["gameId", "playId", "snap_frameId", "los_x"]],
+        on=["gameId", "playId"],
+        how="left",
+    )
+
+    # ── Step 5: Vector-filter to pre-snap safety rows ─────────────────────────
+    presnap_safety: pd.DataFrame = merged[
+        merged["officialPosition"].isin(SAFETY_POSITIONS)
+        & merged["snap_frameId"].notna()
+        & (merged["frameId"] <= merged["snap_frameId"])
+        & merged["los_x"].notna()
+    ].copy()
+
+    # Per-row depth from the line of scrimmage.
+    presnap_safety["depth"] = presnap_safety["x"] - presnap_safety["los_x"]
+
+    # ── Step 6: Single vectorized groupby aggregation ─────────────────────────
+    # pandas .std() defaults to ddof=1; returns NaN when the group has one row.
+    if presnap_safety.empty:
+        safety_agg: pd.DataFrame = pd.DataFrame(
+            columns=[
+                "gameId", "playId",
+                "safety_depth_mean", "safety_depth_std", "n_safety_frames",
+            ]
+        )
+    else:
+        safety_agg = (
+            presnap_safety
+            .groupby(["gameId", "playId"])["depth"]
+            .agg(
+                safety_depth_mean="mean",
+                safety_depth_std="std",
+                n_safety_frames="count",
+            )
+            .reset_index()
+        )
+
+    # ── Step 7: Left-join back to all plays that had a snap event ─────────────
+    # Plays with snap events but no pre-snap safeties receive NaN depth stats
+    # and n_safety_frames = 0 — same semantics as the original loop.
+    result: pd.DataFrame = (
+        play_info[["gameId", "playId", "los_x"]]
+        .merge(safety_agg, on=["gameId", "playId"], how="left")
+    )
+    result["n_safety_frames"] = result["n_safety_frames"].fillna(0).astype(int)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public feature: Velocity Angular Divergence
+# ---------------------------------------------------------------------------
+
+
+def compute_velocity_angular_divergence(
+    tracking_df: pd.DataFrame,
+    fallback_to_nearest: bool = True,
+    receiver_positions: frozenset[str] = OFFENSIVE_SKILL_POSITIONS,
+) -> pd.DataFrame:
+    """
+    Compute the cosine similarity between each secondary defender's velocity
+    vector and the velocity vector of their assigned (or nearest) receiver.
+
+    Interpretation
+    --------------
+    +1.0  — defender and receiver are moving in exactly the same direction
+             (mirror coverage, trailing a route).
+     0.0  — perpendicular motion (cross-field cut vs. lateral defender drift).
+    -1.0  — directly opposing trajectories (press bail vs. receiver release).
+
+    Man defenders typically exhibit high positive cosine similarity because
+    they mirror route stems; zone defenders maintain spatial territory
+    regardless of receiver direction, producing values near zero or negative.
+
+    Velocity vector construction
+    ----------------------------
+    For any tracked player::
+
+        v = (s · cos(dir_rad),  s · sin(dir_rad))
+
+    where ``s`` is speed in yards/second and ``dir_rad`` is the movement
+    direction in standard Cartesian radians (output of
+    ``convert_angles_to_radians``).
+
+    Assignment resolution order
+    ---------------------------
+    Identical to :func:`compute_receiver_cushion`:
+    1. ``pff_primaryDefensiveCoveredReceiverId`` (when available).
+    2. Nearest player in *receiver_positions* via per-frame cKDTree (when
+       *fallback_to_nearest* is ``True``).
+    3. ``np.nan`` when neither source yields a valid match.
+
+    Parameters
+    ----------
+    tracking_df : pd.DataFrame
+        Fully normalized tracking DataFrame.  Must contain ``s``,
+        ``dir_rad``, ``officialPosition``, ``nflId``, ``gameId``,
+        ``playId``, ``frameId``.  **Not mutated.**
+    fallback_to_nearest : bool, default True
+        When ``True``, defenders without a PFF assignment are matched to
+        the spatially nearest eligible receiver.
+    receiver_positions : frozenset[str], default OFFENSIVE_SKILL_POSITIONS
+        Eligible receiver positions for the nearest-receiver fallback.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per secondary defender per tracking frame.  Columns:
+
+        ``gameId``, ``playId``, ``frameId``
+            Frame identifier triple.
+        ``nflId`` : float64
+            Defender player ID.
+        ``velocity_angular_divergence`` : float64
+            Cosine similarity in [−1, +1]; ``np.nan`` when the receiver
+            assignment is unresolved or either player has zero speed
+            (making direction undefined).
+
+    Examples
+    --------
+    >>> vad_df = compute_velocity_angular_divergence(tracking_df)
+    >>> # Frames where defender mirrors receiver motion (likely man coverage)
+    >>> mirroring = vad_df[vad_df["velocity_angular_divergence"] > 0.85]
+    """
+    # Resolve receiver position assignments (x, y, assigned_receiver_id).
+    resolved: pd.DataFrame = _resolve_receiver_assignments(
+        tracking_df, fallback_to_nearest, receiver_positions
+    )
+
+    # Build a slim receiver-velocity lookup keyed by frame + receiver nflId.
+    # The rename maps tracking nflId → assigned_receiver_id so the merge key
+    # aligns with the resolved DataFrame's column name.
+    recv_vel: pd.DataFrame = (
+        tracking_df[_FRAME_KEY + ["nflId", "s", "dir_rad"]]
+        .rename(
+            columns={
+                "nflId": "assigned_receiver_id",
+                "s": "receiver_s",
+                "dir_rad": "receiver_dir_rad",
+            }
+        )
+    )
+
+    result: pd.DataFrame = resolved.merge(
+        recv_vel,
+        on=_FRAME_KEY + ["assigned_receiver_id"],
+        how="left",
+    )
+
+    # Defender velocity components (Cartesian).
+    def_vx: pd.Series = result["s"] * np.cos(result["dir_rad"])
+    def_vy: pd.Series = result["s"] * np.sin(result["dir_rad"])
+
+    # Receiver velocity components (Cartesian).
+    rec_vx: pd.Series = result["receiver_s"] * np.cos(result["receiver_dir_rad"])
+    rec_vy: pd.Series = result["receiver_s"] * np.sin(result["receiver_dir_rad"])
+
+    # Drop the receiver velocity lookup columns immediately — all information
+    # has been extracted into the local vector blocks above.
+    result = result.drop(columns=["receiver_s", "receiver_dir_rad"], errors="ignore")
+
+    dot: pd.Series = def_vx * rec_vx + def_vy * rec_vy
+    def_mag: pd.Series = np.sqrt(def_vx ** 2 + def_vy ** 2)
+    rec_mag: pd.Series = np.sqrt(rec_vx ** 2 + rec_vy ** 2)
+    denom: pd.Series = def_mag * rec_mag
+
+    # Cosine similarity is undefined when either speed is zero; emit NaN.
+    result["velocity_angular_divergence"] = np.where(
+        denom > 0,
+        dot / denom,
+        np.nan,
+    )
+
+    output_cols: list[str] = _FRAME_KEY + ["nflId", "velocity_angular_divergence"]
+    available: list[str] = [c for c in output_cols if c in result.columns]
+    return result[available].copy()
