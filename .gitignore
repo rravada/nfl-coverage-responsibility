@@ -23,9 +23,11 @@ Thumbs.db
 *.swp
 *.swo
 
-# VS Code / Cursor
+# VS Code / Cursor / Claude
 .vscode/
 .cursor/
+CLAUDE.local.md
+.claude/settings.local.json
 
 # Machine Learning Artifacts
 models/
