@@ -15,6 +15,7 @@ venv/
 data/raw/
 data/interim/
 data/processed/
+data/feature_store/
 *.parquet
 
 # OS / editor
