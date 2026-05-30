@@ -27,7 +27,7 @@ Thumbs.db
 # VS Code / Cursor / Claude
 .vscode/
 .cursor/
-CLAUDE.local.md
+CLAUDE.md
 .claude/settings.local.json
 
 # Machine Learning Artifacts
