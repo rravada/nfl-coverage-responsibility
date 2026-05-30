@@ -11,7 +11,7 @@ venv/
 .ipynb_checkpoints/
 *.ipynb_backup
 
-# Data files (local only – do not commit tracking CSVs)
+# Data files (local only - do not commit tracking CSVs)
 data/raw/
 data/interim/
 data/processed/
@@ -31,5 +31,5 @@ CLAUDE.md
 .claude/settings.local.json
 
 # Machine Learning Artifacts
-models/
+/models/
 outputs/
