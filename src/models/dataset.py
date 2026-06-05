@@ -2,17 +2,21 @@
 NFLCoverageDataset — PyTorch Dataset for the factorized attention transformer
 (AWS/NGS architecture, arxiv:2603.25901).
 
-Each sample is one play. __getitem__ returns a dict with four keys:
+Each sample is one play. __getitem__ returns a dict with six keys:
 
-    features   float32  (MAX_FRAMES, MAX_AGENTS, 15)
-                        Padded with NAN_FILL_VALUE where no defender is present.
-    labels     int64    (MAX_FRAMES, MAX_AGENTS)
-                        -1 where padded, unknown label, or no defender.
-    agent_mask bool     (MAX_FRAMES, MAX_AGENTS)
-                        True only where a real defender row exists.
-    meta       dict     gameId (int), playId (int),
-                        frameIds (np.int32, real frames only),
-                        defenderIds (np.float64, real agents only)
+    features     float32  (MAX_FRAMES, MAX_AGENTS, 15)
+                          Padded with NAN_FILL_VALUE where no defender is present.
+    labels       int64    (MAX_FRAMES, MAX_AGENTS)
+                          -1 where padded, unknown label, or no defender.
+    agent_mask   bool     (MAX_FRAMES, MAX_AGENTS)
+                          True only where a real defender row exists.
+    position_ids int64    (MAX_AGENTS,)  one position_id per agent slot;
+                          padded slots → POSITION_UNKNOWN_ID.
+    team_ids     int64    (MAX_AGENTS,)  one team_id per agent slot (0=offense,
+                          1=defense); padded slots → 0.
+    meta         dict     gameId (int), playId (int),
+                          frameIds (np.int32, real frames only),
+                          defenderIds (np.float64, real agents only)
 
 Agent slot assignment: the union of all defender_nflIds across every frame in the
 play is sorted ascending and assigned slot indices 0…A-1. The same agent occupies
@@ -55,6 +59,7 @@ from src.config import (
     MAX_AGENTS,
     MAX_FRAMES,
     NAN_FILL_VALUE,
+    POSITION_UNKNOWN_ID,
     TARGET_COLUMN,
 )
 
@@ -73,6 +78,8 @@ class _PlayData:
     pass_arrival_local_idx: int      # -1 if absent
     frame_ids: np.ndarray            # (T,) int32
     agent_ids: np.ndarray            # (A,) float64
+    position_ids: np.ndarray         # (A,) int64
+    team_ids: np.ndarray             # (A,) int64
     game_id: int
     play_id: int
 
@@ -175,6 +182,17 @@ class NFLCoverageDataset(Dataset):
         else:
             pass_arrival_local_idx = frame_id_map[candidates.idxmax()]
 
+        # --- per-agent position and team ids (first valid frame per agent) ---
+        agent_meta = (
+            play_df[["defender_nflId", "position_id", "team_id"]]
+            .dropna(subset=["defender_nflId"])
+            .groupby("defender_nflId")[["position_id", "team_id"]]
+            .first()
+        )
+        reindexed = agent_meta.reindex(agent_ids)
+        position_ids_arr = reindexed["position_id"].fillna(POSITION_UNKNOWN_ID).values.astype(np.int64)
+        team_ids_arr = reindexed["team_id"].fillna(0).values.astype(np.int64)
+
         return _PlayData(
             feature_array=feature_array,
             label_array=label_array,
@@ -185,6 +203,8 @@ class NFLCoverageDataset(Dataset):
             pass_arrival_local_idx=pass_arrival_local_idx,
             frame_ids=frame_ids,
             agent_ids=agent_ids,
+            position_ids=position_ids_arr,
+            team_ids=team_ids_arr,
             game_id=game_id,
             play_id=play_id,
         )
@@ -258,10 +278,17 @@ class NFLCoverageDataset(Dataset):
         labels[:T_s, :A] = play.label_array[start:end]
         agent_mask[:T_s, :A] = play.presence_mask[start:end]
 
+        position_ids_out = np.full(MAX_AGENTS, POSITION_UNKNOWN_ID, dtype=np.int64)
+        team_ids_out = np.zeros(MAX_AGENTS, dtype=np.int64)
+        position_ids_out[:A] = play.position_ids
+        team_ids_out[:A] = play.team_ids
+
         return {
             "features": torch.from_numpy(features),
             "labels": torch.from_numpy(labels),
             "agent_mask": torch.from_numpy(agent_mask),
+            "position_ids": torch.from_numpy(position_ids_out),
+            "team_ids": torch.from_numpy(team_ids_out),
             "meta": {
                 "gameId": play.game_id,
                 "playId": play.play_id,

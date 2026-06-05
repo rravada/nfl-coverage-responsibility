@@ -31,3 +31,11 @@ MODELS_DIR: str = "models"
 MAX_AGENTS: int = 22
 MAX_FRAMES: int = 200
 SEASON: int = 2022
+
+NUM_POSITION_CLASSES: int = 11
+NUM_TEAM_CLASSES: int = 2
+POSITION_UNKNOWN_ID: int = 10
+POSITION_MAP: dict[str, int] = {
+    "CB": 0, "S": 1, "FS": 1, "SS": 1, "LB": 2, "ILB": 2, "OLB": 2, "MLB": 2,
+    "DB": 3, "DL": 4, "OL": 5, "WR": 6, "TE": 7, "RB": 8, "QB": 9,
+}

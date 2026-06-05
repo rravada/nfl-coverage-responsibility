@@ -5,7 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, SNAP_EVENT
+from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, POSITION_MAP, POSITION_UNKNOWN_ID, SNAP_EVENT
 
 _FRAME_KEY: list[str] = ["gameId", "playId", "frameId"]
 _PRESERVE_FLOAT64: frozenset[str] = frozenset(
@@ -106,6 +106,35 @@ def derive_territory_ratio(df: pd.DataFrame) -> pd.DataFrame:
         df["territory_area_sq_yd"] / _frame_total,
         np.nan,
     )
+    return df
+
+
+def add_position_and_team_ids(
+    df: pd.DataFrame,
+    players_df: pd.DataFrame,
+    plays_df: pd.DataFrame,
+) -> pd.DataFrame:
+    df = df.copy()
+
+    pos_lookup = (
+        players_df[["nflId", "officialPosition"]]
+        .drop_duplicates("nflId")
+        .rename(columns={"nflId": "defender_nflId"})
+    )
+    df = df.merge(pos_lookup, on="defender_nflId", how="left")
+    df["position_id"] = (
+        df["officialPosition"].map(POSITION_MAP).fillna(POSITION_UNKNOWN_ID).astype(np.int8)
+    )
+    df = df.drop(columns=["officialPosition"])
+
+    poss_lookup = (
+        plays_df[["gameId", "playId", "possessionTeam"]]
+        .drop_duplicates(["gameId", "playId"])
+    )
+    df = df.merge(poss_lookup, on=["gameId", "playId"], how="left")
+    df["team_id"] = np.where(df["team"] == df["possessionTeam"], 0, 1).astype(np.int8)
+    df = df.drop(columns=["possessionTeam", "team"])
+
     return df
 
 

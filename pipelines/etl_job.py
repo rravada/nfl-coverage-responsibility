@@ -49,6 +49,7 @@ from src.etl.schema import validate_schema
 from src.etl.transforms import (
     add_frames_since_snap,
     add_play_group_key,
+    add_position_and_team_ids,
     add_snap_frame_marker,
     apply_nan_sentinel,
     derive_coverage_labels,
@@ -235,6 +236,14 @@ def process_game(
 
     drop_cols = [c for c in ["event", "assigned_receiver_nflId", "pff_coverage"] if c in feature_df.columns]
     feature_df = feature_df.drop(columns=drop_cols)
+
+    team_lookup = (
+        slice_raw[["nflId", "team"]]
+        .drop_duplicates("nflId")
+        .rename(columns={"nflId": "defender_nflId"})
+    )
+    feature_df = feature_df.merge(team_lookup, on="defender_nflId", how="left")
+    feature_df = add_position_and_team_ids(feature_df, players_df, game_plays)
 
     validate_schema(feature_df)
 

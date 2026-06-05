@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE  # noqa: F401  (sentinel intent)
+from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, NUM_POSITION_CLASSES, NUM_TEAM_CLASSES  # noqa: F401  (sentinel intent)
 
 
 class FactorizedAttentionBlock(nn.Module):
@@ -86,15 +86,28 @@ class CoverageMatchupTransformer(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.position_embedding = nn.Embedding(NUM_POSITION_CLASSES, d_model)
+        self.team_embedding = nn.Embedding(NUM_TEAM_CLASSES, d_model)
         self.output_head = nn.Linear(d_model, num_classes)
 
     def forward(
-        self, features: torch.Tensor, agent_mask: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        features: torch.Tensor,      # (B, T, A, 15)
+        agent_mask: torch.Tensor,    # (B, T, A) bool
+        position_ids: torch.Tensor,  # (B, A) int64
+        team_ids: torch.Tensor,      # (B, A) int64
+    ) -> torch.Tensor:               # (B, A, num_classes)
         # Drop NAN_FILL_VALUE sentinel at padded positions before projection.
         features = features.masked_fill(~agent_mask.unsqueeze(-1), 0.0)
         x = self.input_proj(features)
         for block in self.blocks:
             x = block(x, agent_mask)
-        logits = self.output_head(x)
-        return logits
+
+        # Temporal mean-pool over valid frames per agent.
+        mask_float = agent_mask.float()                                    # (B, T, A)
+        valid_counts = mask_float.sum(dim=1).clamp(min=1).unsqueeze(-1)   # (B, A, 1)
+        pooled = (x * mask_float.unsqueeze(-1)).sum(dim=1) / valid_counts
+        # pooled: (B, A, d_model)
+
+        fused = pooled + self.position_embedding(position_ids) + self.team_embedding(team_ids)
+        return self.output_head(fused)  # (B, A, num_classes)

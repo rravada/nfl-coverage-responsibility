@@ -14,6 +14,8 @@ FEATURE_STORE_SCHEMA: dict[str, str] = {
     "is_snap_frame": "bool",
     "frames_since_snap": "int16",
     "play_group_key": "object",
+    "position_id": "int8",
+    "team_id": "int8",
 }
 
 
