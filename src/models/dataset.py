@@ -53,6 +53,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
 
 from src.config import (
     FEATURE_COLUMNS,
@@ -296,3 +297,13 @@ class NFLCoverageDataset(Dataset):
                 "defenderIds": play.agent_ids,
             },
         }
+
+
+def collate_fn(batch: list[dict]) -> dict:
+    # meta.frameIds is variable-length across plays and cannot be stacked by the
+    # default collator; keep meta as a list of dicts and collate everything else.
+    meta_list = [item["meta"] for item in batch]
+    tensor_batch = [{k: v for k, v in item.items() if k != "meta"} for item in batch]
+    result = default_collate(tensor_batch)
+    result["meta"] = meta_list
+    return result
