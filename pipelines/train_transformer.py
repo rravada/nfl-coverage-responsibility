@@ -17,6 +17,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from src.config import FEATURE_STORE_DIR, MODELS_DIR, TRAIN_HASH_THRESHOLD
 from src.models.dataset import NFLCoverageDataset, collate_fn
 from src.models.transformer import CoverageMatchupTransformer
@@ -210,7 +214,7 @@ def main() -> None:
         final_div_factor=100.0,
     )
 
-    best_val_loss = float("inf")
+    best_val_acc = float("-inf")
     checkpoint_path = models_dir / "transformer_best.pt"
 
     for epoch in range(1, epochs + 1):
@@ -224,8 +228,8 @@ def main() -> None:
             "Epoch %d/%d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f | lr=%.2e",
             epoch, epochs, train_loss, val_loss, val_acc, lr,
         )
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             torch.save(
                 {
                     "epoch": epoch,
@@ -237,9 +241,9 @@ def main() -> None:
                 },
                 checkpoint_path,
             )
-            log.info("Checkpoint saved (val_loss=%.4f)", val_loss)
+            log.info("Checkpoint saved (val_acc=%.4f)", val_acc)
 
-    log.info("Training complete. Best val_loss=%.4f", best_val_loss)
+    log.info("Training complete. Best val_acc=%.4f", best_val_acc)
 
 
 if __name__ == "__main__":

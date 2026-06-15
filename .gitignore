@@ -16,6 +16,7 @@ data/raw/
 data/interim/
 data/processed/
 data/feature_store/
+data/predictions/
 *.parquet
 
 # OS / editor
