@@ -5,7 +5,16 @@ import logging
 import numpy as np
 import pandas as pd
 
-from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, POSITION_MAP, POSITION_UNKNOWN_ID, SNAP_EVENT
+from src.config import (
+    FEATURE_COLUMNS,
+    MATCHUP_TARGET_COLUMN,
+    MAX_RECEIVERS,
+    NAN_FILL_VALUE,
+    NO_MATCHUP_SLOT,
+    POSITION_MAP,
+    POSITION_UNKNOWN_ID,
+    SNAP_EVENT,
+)
 
 _FRAME_KEY: list[str] = ["gameId", "playId", "frameId"]
 _PRESERVE_FLOAT64: frozenset[str] = frozenset(
@@ -134,6 +143,141 @@ def add_position_and_team_ids(
     df = df.merge(poss_lookup, on=["gameId", "playId"], how="left")
     df["team_id"] = np.where(df["team"] == df["possessionTeam"], 0, 1).astype(np.int8)
     df = df.drop(columns=["possessionTeam", "team"])
+
+    return df
+
+
+_ELIGIBLE_POSITIONS: frozenset[str] = frozenset({"WR", "TE", "RB", "FB"})
+
+
+def derive_matchup_slots(
+    feature_df: pd.DataFrame,
+    normalized: pd.DataFrame,
+    plays_df: pd.DataFrame,  # retained for API compatibility; not used directly
+) -> pd.DataFrame:
+    """Attach per-play relative receiver slot labels to the defender feature rows.
+
+    Adds two columns to *feature_df* (which must already contain
+    ``assigned_receiver_nflId`` and ``coverage_label``):
+
+    ``matchup_slot`` (int8)
+        0‥MAX_RECEIVERS-1 — the left-to-right slot of the covered receiver;
+        NO_MATCHUP_SLOT — zone coverage or receiver absent from roster.
+
+    ``slot_receiver_nflIds`` (object — list[int])
+        The ordered roster of eligible receiver nflIds for that play (length
+        ≤ MAX_RECEIVERS).  Broadcast to every defender-frame row of the play
+        so that offline inference can re-expand slot probabilities back to
+        actual receiver IDs.
+
+    Eligible receivers are skill-position offensive players (WR / TE / RB / FB
+    on the possessionTeam) present at the snap frame (or the play's first frame
+    when no snap row exists), ordered left-to-right by *y*-coordinate with
+    nflId as a tie-break.  Only the first MAX_RECEIVERS are kept.
+
+    ``possessionTeam`` is read directly from *normalized* (build_normalized_tracking
+    already merges plays metadata in before this function is called).
+
+    This function is vectorised (groupby / merge) and does not iterate over
+    individual rows or frames.
+    """
+    df = feature_df.copy()
+
+    # ------------------------------------------------------------------ #
+    # 1.  Build per-play eligible-receiver rosters from the full tracking  #
+    #     frame (normalized contains all 22 players, not just defenders).  #
+    # ------------------------------------------------------------------ #
+    # Identify each player's snap frame; fall back to the play's minimum frameId.
+    # normalized already carries possessionTeam (merged in by build_normalized_tracking).
+    snap_flag = normalized["event"].eq(SNAP_EVENT)
+    snap_frames = (
+        normalized[snap_flag]
+        .groupby(["gameId", "playId"])["frameId"]
+        .first()
+        .rename("snap_frameId")
+        .reset_index()
+    )
+    first_frames = (
+        normalized.groupby(["gameId", "playId"])["frameId"]
+        .min()
+        .rename("snap_frameId")
+        .reset_index()
+    )
+    # Prefer actual snap; fall back to first frame when absent.
+    ref_frames = (
+        first_frames
+        .merge(snap_frames, on=["gameId", "playId"], how="left", suffixes=("_first", "_snap"))
+    )
+    ref_frames["snap_frameId"] = (
+        ref_frames["snap_frameId_snap"].combine_first(ref_frames["snap_frameId_first"])
+    )
+    ref_frames = ref_frames[["gameId", "playId", "snap_frameId"]]
+
+    # Filter normalized to only the reference frame rows.
+    snap_tracking = normalized.merge(ref_frames, on=["gameId", "playId"], how="inner")
+    snap_tracking = snap_tracking[snap_tracking["frameId"] == snap_tracking["snap_frameId"]]
+
+    # Keep only eligible offensive skill players (possessionTeam is already present
+    # in normalized / snap_tracking from build_normalized_tracking).
+    eligible = snap_tracking[
+        snap_tracking["officialPosition"].isin(_ELIGIBLE_POSITIONS)
+        & (snap_tracking["team"] == snap_tracking["possessionTeam"])
+    ].copy()
+
+    # Sort left-to-right (ascending y) with nflId as tie-break; keep ≤ MAX_RECEIVERS.
+    eligible = eligible.sort_values(["gameId", "playId", "y", "nflId"])
+    eligible["_slot_rank"] = (
+        eligible.groupby(["gameId", "playId"]).cumcount()
+    )
+    eligible = eligible[eligible["_slot_rank"] < MAX_RECEIVERS]
+
+    # Build roster map: (gameId, playId, nflId) → slot index.
+    roster_slot = eligible[["gameId", "playId", "nflId", "_slot_rank"]].rename(
+        columns={"nflId": "assigned_receiver_nflId", "_slot_rank": "_recv_slot"}
+    )
+
+    # Build per-play roster list (ordered list[int] of nflIds).
+    roster_list = (
+        eligible.sort_values(["gameId", "playId", "_slot_rank"])
+        .groupby(["gameId", "playId"])["nflId"]
+        .apply(lambda s: [int(x) for x in s])
+        .rename("slot_receiver_nflIds")
+        .reset_index()
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2.  Map each defender-frame row to its receiver's slot index.        #
+    # ------------------------------------------------------------------ #
+    # assigned_receiver_nflId is float64 in feature_df; copy to a safe key.
+    df["_assigned_int"] = df["assigned_receiver_nflId"]
+
+    # Left join: each df row matches at most one roster_slot row.
+    # reset_index on both sides guarantees positional alignment.
+    df_reset = df.reset_index(drop=True)
+    roster_for_join = roster_slot.rename(columns={"assigned_receiver_nflId": "_assigned_int"})
+    merged = df_reset.merge(roster_for_join, on=["gameId", "playId", "_assigned_int"], how="left")
+
+    # Default is NO_MATCHUP_SLOT; man-coverage rows get their receiver slot rank.
+    is_man = df_reset["coverage_label"].ne("No_Matchup_Zone")
+    recv_slot = merged["_recv_slot"].reset_index(drop=True)
+    matchup_slot = np.where(
+        is_man.values & recv_slot.notna().values,
+        recv_slot.values,
+        NO_MATCHUP_SLOT,
+    ).astype(np.int8)
+
+    df_reset[MATCHUP_TARGET_COLUMN] = matchup_slot
+    df = df_reset.drop(columns=["_assigned_int"])
+
+    # ------------------------------------------------------------------ #
+    # 3.  Broadcast the roster list to every row of the play.             #
+    # ------------------------------------------------------------------ #
+    df = df.merge(roster_list, on=["gameId", "playId"], how="left")
+    # Plays with no eligible receivers (rare): fill NaN cells with empty list.
+    # Using apply on the whole column avoids pandas .loc/list-assignment gotchas.
+    df["slot_receiver_nflIds"] = df["slot_receiver_nflIds"].apply(
+        lambda v: v if isinstance(v, list) else []
+    )
 
     return df
 

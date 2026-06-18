@@ -53,6 +53,7 @@ from src.etl.transforms import (
     add_snap_frame_marker,
     apply_nan_sentinel,
     derive_coverage_labels,
+    derive_matchup_slots,
     derive_territory_ratio,
     downcast_memory,
 )
@@ -228,6 +229,7 @@ def process_game(
     feature_df = feature_df.merge(event_lookup, on=_FRAME_KEY, how="left")
 
     feature_df = derive_coverage_labels(feature_df, pff_df)
+    feature_df = derive_matchup_slots(feature_df, normalized, game_plays)
     feature_df = add_snap_frame_marker(feature_df)
     feature_df = add_frames_since_snap(feature_df)
     feature_df = add_play_group_key(feature_df)

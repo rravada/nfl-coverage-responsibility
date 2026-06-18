@@ -36,9 +36,11 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.config import FEATURE_STORE_DIR
+from src.config import FEATURE_STORE_DIR, NO_MATCHUP_SLOT, NUM_MATCHUP_CLASSES
 from src.models.dataset import NFLCoverageDataset
 from src.models.transformer import CoverageMatchupTransformer
+
+_ZONE_COL = "No_Matchup_Zone"
 
 OUTPUT_DIR = Path("data/predictions")
 CHECKPOINT_PATH = Path("models/transformer_best.pt")
@@ -81,16 +83,24 @@ def _load_checkpoint(device: torch.device) -> dict:
     return torch.load(CHECKPOINT_PATH, map_location=device)
 
 
-def _class_names(label_map: dict[str, int]) -> list[str]:
-    return [label for label, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
-
-
 def _predict_play(
     model: CoverageMatchupTransformer,
     item: dict,
-    class_names: list[str],
     device: torch.device,
 ) -> pd.DataFrame | None:
+    """Run model for one play and re-expand slot probabilities to receiver nflIds.
+
+    Steps:
+    1. Mask invalid receiver slot logits to -1e9 (slots >= numEligible, except
+       NO_MATCHUP_SLOT which is always valid).
+    2. Softmax over the masked 6-class logit vector.
+    3. Re-expand: slot i → str(slotReceiverIds[i]); NO_MATCHUP_SLOT → "No_Matchup_Zone".
+    4. Renormalise the kept columns to sum to exactly 1.0.
+    5. Output one row per present defender, columns = receiver nflId strings + no-matchup.
+    """
+    num_eligible: int = item["meta"]["numEligible"]
+    slot_receiver_ids: list = item["meta"]["slotReceiverIds"]
+
     features = item["features"].unsqueeze(0).to(device)
     agent_mask_t = item["agent_mask"].unsqueeze(0).to(device)
     position_ids = item["position_ids"].unsqueeze(0).to(device)
@@ -98,6 +108,15 @@ def _predict_play(
 
     with torch.no_grad():
         logits = model(features, agent_mask_t, position_ids, team_ids)  # (1, A, C)
+
+        # Mask empty receiver slots — same masking applied during training.
+        C = logits.size(-1)
+        eligible_mask = torch.zeros(1, C, dtype=torch.bool, device=device)
+        if num_eligible > 0:
+            eligible_mask[0, :num_eligible] = True
+        eligible_mask[0, NO_MATCHUP_SLOT] = True
+        logits = logits.masked_fill(~eligible_mask.unsqueeze(1), -1e9)
+
         probs = F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()       # (A, C)
 
     agent_mask = item["agent_mask"].numpy()                              # (T, A) bool
@@ -107,9 +126,19 @@ def _predict_play(
 
     defender_ids = np.asarray(item["meta"]["defenderIds"])
     nfl_ids = defender_ids[a_idx].astype(np.int64)
-    prob_rows = probs[a_idx].astype(np.float32)
+    prob_rows = probs[a_idx].astype(np.float32)                          # (present, C)
 
-    out = pd.DataFrame(prob_rows, columns=class_names)
+    # Build output columns: eligible receiver nflId strings + no-matchup.
+    col_names = [str(rid) for rid in slot_receiver_ids] + [_ZONE_COL]
+    valid_slot_indices = list(range(num_eligible)) + [NO_MATCHUP_SLOT]
+    kept_probs = prob_rows[:, valid_slot_indices]                         # (present, ne+1)
+
+    # Renormalise so columns sum to exactly 1.0 per defender.
+    row_sums = kept_probs.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums > 0, row_sums, 1.0)
+    kept_probs = (kept_probs / row_sums).astype(np.float32)
+
+    out = pd.DataFrame(kept_probs, columns=col_names)
     out.insert(0, "nflId", nfl_ids)
     return out
 
@@ -148,16 +177,14 @@ def main() -> None:
         raise RuntimeError(f"No features.parquet files found under {FEATURE_STORE_DIR}")
 
     checkpoint = _load_checkpoint(device)
-    label_map: dict[str, int] = checkpoint["label_map"]
-    num_classes: int = checkpoint["num_classes"]
-    class_names = _class_names(label_map)
+    num_classes: int = checkpoint.get("num_classes", NUM_MATCHUP_CLASSES)
 
     selected_game_ids = sorted(game_id_to_path)
     if args.smoke_test:
         selected_game_ids = selected_game_ids[:2]
     paths = [game_id_to_path[g] for g in selected_game_ids]
 
-    dataset = NFLCoverageDataset(paths, label_map=label_map, truncate=False)
+    dataset = NFLCoverageDataset(paths, label_map=None, truncate=False)
 
     model = CoverageMatchupTransformer(num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -177,7 +204,7 @@ def main() -> None:
             play_id = item["meta"]["playId"]
             log.debug("Predicting game %d play %d", game_id, play_id)
 
-            predictions = _predict_play(model, item, class_names, device)
+            predictions = _predict_play(model, item, device)
             if predictions is None:
                 continue
 

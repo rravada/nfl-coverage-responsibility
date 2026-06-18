@@ -11,6 +11,8 @@ FEATURE_STORE_SCHEMA: dict[str, str] = {
     "defender_nflId": "float64",
     **{col: "float32" for col in FEATURE_COLUMNS},
     "coverage_label": "object",
+    "matchup_slot": "int8",
+    "slot_receiver_nflIds": "object",
     "is_snap_frame": "bool",
     "frames_since_snap": "int16",
     "play_group_key": "object",

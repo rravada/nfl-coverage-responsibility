@@ -21,7 +21,14 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.config import FEATURE_STORE_DIR, MODELS_DIR, TRAIN_HASH_THRESHOLD
+from src.config import (
+    FEATURE_STORE_DIR,
+    MAX_RECEIVERS,
+    MODELS_DIR,
+    NO_MATCHUP_SLOT,
+    NUM_MATCHUP_CLASSES,
+    TRAIN_HASH_THRESHOLD,
+)
 from src.models.dataset import NFLCoverageDataset, collate_fn
 from src.models.transformer import CoverageMatchupTransformer
 
@@ -130,6 +137,19 @@ def _run_epoch(
             team_ids = batch["team_ids"].to(device)
 
             logits = model(features, agent_mask, position_ids, team_ids)  # (B, A, C)
+
+            # Mask receiver slots that are empty for this play to -1e9 so the
+            # head cannot put probability mass on non-existent receivers.
+            # NO_MATCHUP_SLOT is always kept.  (Paper §A.2 masking approach.)
+            B_size = logits.size(0)
+            eligible_mask = torch.zeros(B_size, num_classes, dtype=torch.bool, device=device)
+            for b, m in enumerate(batch["meta"]):
+                ne = int(m["numEligible"])
+                if ne > 0:
+                    eligible_mask[b, :ne] = True
+            eligible_mask[:, NO_MATCHUP_SLOT] = True
+            logits = logits.masked_fill(~eligible_mask.unsqueeze(1), -1e9)
+
             play_labels = _aggregate_labels(labels)                        # (B, A)
 
             loss = criterion(logits.reshape(-1, num_classes), play_labels.reshape(-1))
@@ -195,7 +215,7 @@ def main() -> None:
         pin_memory=False, collate_fn=collate_fn,
     )
 
-    num_classes = len(train_ds.label_map)
+    num_classes = NUM_MATCHUP_CLASSES  # fixed 6-class per-play relative slot head
     model = CoverageMatchupTransformer(num_classes=num_classes).to(device)
     log.info("Parameters: %d", sum(p.numel() for p in model.parameters()))
 
@@ -236,8 +256,10 @@ def main() -> None:
                     "model_state_dict": model.state_dict(),
                     "val_loss": val_loss,
                     "val_accuracy": val_acc,
-                    "label_map": train_ds.label_map,
-                    "num_classes": num_classes,
+                    "label_map": train_ds.label_map,    # fixed slot→name map
+                    "num_classes": num_classes,          # always NUM_MATCHUP_CLASSES
+                    "max_receivers": MAX_RECEIVERS,
+                    "no_matchup_slot": NO_MATCHUP_SLOT,
                 },
                 checkpoint_path,
             )

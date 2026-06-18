@@ -30,6 +30,10 @@ FEATURE_STORE_DIR: str = "data/feature_store"
 MODELS_DIR: str = "models"
 MAX_AGENTS: int = 22
 MAX_FRAMES: int = 200
+MAX_RECEIVERS: int = 5           # eligible receiver slots per play
+NO_MATCHUP_SLOT: int = 5         # last index — zone / no man matchup
+NUM_MATCHUP_CLASSES: int = 6     # MAX_RECEIVERS + 1
+MATCHUP_TARGET_COLUMN: str = "matchup_slot"
 SEASON: int = 2022
 
 NUM_POSITION_CLASSES: int = 11

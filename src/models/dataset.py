@@ -57,9 +57,13 @@ from torch.utils.data._utils.collate import default_collate
 
 from src.config import (
     FEATURE_COLUMNS,
+    MATCHUP_TARGET_COLUMN,
     MAX_AGENTS,
     MAX_FRAMES,
+    MAX_RECEIVERS,
     NAN_FILL_VALUE,
+    NO_MATCHUP_SLOT,
+    NUM_MATCHUP_CLASSES,
     POSITION_UNKNOWN_ID,
     TARGET_COLUMN,
 )
@@ -67,11 +71,20 @@ from src.config import (
 _N_FEATURES = len(FEATURE_COLUMNS)
 _ZONE_LABEL = "No_Matchup_Zone"
 
+# Fixed label map: slot_0..slot_4 map to indices 0-4; No_Matchup_Zone → 5.
+# This is play-relative: slot index i corresponds to that play's i-th eligible
+# receiver (sorted left-to-right at snap).  The map is constant across plays
+# and across the full corpus.
+_FIXED_LABEL_MAP: dict[str, int] = {
+    f"slot_{i}": i for i in range(MAX_RECEIVERS)
+}
+_FIXED_LABEL_MAP[_ZONE_LABEL] = NO_MATCHUP_SLOT
+
 
 @dataclass(frozen=True)
 class _PlayData:
     feature_array: np.ndarray        # (T, A, _N_FEATURES) float32
-    label_array: np.ndarray          # (T, A) int64
+    label_array: np.ndarray          # (T, A) int64  — slot indices 0‥NO_MATCHUP_SLOT
     presence_mask: np.ndarray        # (T, A) bool
     n_frames: int
     n_agents: int
@@ -83,6 +96,8 @@ class _PlayData:
     team_ids: np.ndarray             # (A,) int64
     game_id: int
     play_id: int
+    slot_receiver_ids: list          # ordered list[int] of eligible receiver nflIds
+    num_eligible: int                # number of filled receiver slots (≤ MAX_RECEIVERS)
 
 
 class NFLCoverageDataset(Dataset):
@@ -94,9 +109,11 @@ class NFLCoverageDataset(Dataset):
         truncate: bool,
     ) -> None:
         self.truncate = truncate
+        # label_map is fixed and play-relative; any caller-supplied map is
+        # accepted for API compatibility but the canonical map is always used.
+        self.label_map: dict[str, int] = _FIXED_LABEL_MAP
 
         if not parquet_paths:
-            self.label_map: dict[str, int] = label_map or {}
             self.plays: list[_PlayData] = []
             return
 
@@ -104,29 +121,11 @@ class NFLCoverageDataset(Dataset):
             [pd.read_parquet(p) for p in parquet_paths], ignore_index=True
         )
 
-        if label_map is None:
-            all_labels = set(all_df[TARGET_COLUMN].dropna().unique())
-            self.label_map = self._build_label_map(all_labels)
-        else:
-            self.label_map = label_map
-
         self.plays = []
         for (game_id, play_id), play_df in all_df.groupby(["gameId", "playId"]):
             self.plays.append(
                 self._build_play_arrays(play_df, int(game_id), int(play_id))
             )
-
-    # ------------------------------------------------------------------
-    # Label map
-    # ------------------------------------------------------------------
-
-    def _build_label_map(self, all_labels: set[str]) -> dict[str, int]:
-        numeric = sorted(
-            (l for l in all_labels if l != _ZONE_LABEL),
-            key=lambda l: int(l),
-        )
-        ordered = numeric + [_ZONE_LABEL]
-        return {label: idx for idx, label in enumerate(ordered)}
 
     # ------------------------------------------------------------------
     # Per-play pre-computation
@@ -159,11 +158,10 @@ class NFLCoverageDataset(Dataset):
         fi_v = fi[valid]
         ai_v = ai_raw[valid].values.astype(np.int32)
         feature_vals = play_df.loc[valid, FEATURE_COLUMNS].values.astype(np.float32)
-        label_v = (
-            play_df.loc[valid, TARGET_COLUMN]
-            .map(lambda l: self.label_map.get(l, -1))
-            .values.astype(np.int64)
-        )
+        # Use the per-play relative slot column (int8, values 0‥NO_MATCHUP_SLOT).
+        # Rows without a valid slot (e.g. NaN from a missing column) fall back to -1.
+        raw_slots = play_df.loc[valid, MATCHUP_TARGET_COLUMN]
+        label_v = pd.to_numeric(raw_slots, errors="coerce").fillna(-1).values.astype(np.int64)
         feature_array[fi_v, ai_v, :] = feature_vals
         label_array[fi_v, ai_v] = label_v
         presence_mask[fi_v, ai_v] = True
@@ -194,6 +192,21 @@ class NFLCoverageDataset(Dataset):
         position_ids_arr = reindexed["position_id"].fillna(POSITION_UNKNOWN_ID).values.astype(np.int64)
         team_ids_arr = reindexed["team_id"].fillna(0).values.astype(np.int64)
 
+        # --- per-play receiver roster (for inference slot → nflId re-expansion) ---
+        # slot_receiver_nflIds is broadcast to every row; grab the first non-null value.
+        # Normalise to list[int] regardless of how pyarrow reconstructs the column
+        # (Python list, numpy array, or pyarrow ListScalar are all iterable).
+        slot_receiver_ids: list = []
+        if "slot_receiver_nflIds" in play_df.columns:
+            roster_series = play_df["slot_receiver_nflIds"].dropna()
+            if len(roster_series):
+                raw = roster_series.iloc[0]
+                try:
+                    slot_receiver_ids = [int(x) for x in raw]
+                except (TypeError, ValueError):
+                    slot_receiver_ids = []
+        num_eligible = len(slot_receiver_ids)
+
         return _PlayData(
             feature_array=feature_array,
             label_array=label_array,
@@ -208,6 +221,8 @@ class NFLCoverageDataset(Dataset):
             team_ids=team_ids_arr,
             game_id=game_id,
             play_id=play_id,
+            slot_receiver_ids=slot_receiver_ids,
+            num_eligible=num_eligible,
         )
 
     # ------------------------------------------------------------------
@@ -295,6 +310,8 @@ class NFLCoverageDataset(Dataset):
                 "playId": play.play_id,
                 "frameIds": play.frame_ids[start:end],
                 "defenderIds": play.agent_ids,
+                "slotReceiverIds": play.slot_receiver_ids,
+                "numEligible": play.num_eligible,
             },
         }
 
