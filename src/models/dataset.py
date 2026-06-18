@@ -4,7 +4,8 @@ NFLCoverageDataset — PyTorch Dataset for the factorized attention transformer
 
 Each sample is one play. __getitem__ returns a dict with six keys:
 
-    features     float32  (MAX_FRAMES, MAX_AGENTS, 15)
+    features     float32  (MAX_FRAMES, MAX_AGENTS, 4)
+                          4 raw kinematic features: x, y, o_rad, dir_rad.
                           Padded with NAN_FILL_VALUE where no defender is present.
     labels       int64    (MAX_FRAMES, MAX_AGENTS)
                           -1 where padded, unknown label, or no defender.
@@ -56,7 +57,6 @@ from torch.utils.data import Dataset
 from torch.utils.data._utils.collate import default_collate
 
 from src.config import (
-    FEATURE_COLUMNS,
     MATCHUP_TARGET_COLUMN,
     MAX_AGENTS,
     MAX_FRAMES,
@@ -66,9 +66,10 @@ from src.config import (
     NUM_MATCHUP_CLASSES,
     POSITION_UNKNOWN_ID,
     TARGET_COLUMN,
+    TRANSFORMER_FEATURE_COLUMNS,
 )
 
-_N_FEATURES = len(FEATURE_COLUMNS)
+_N_FEATURES = len(TRANSFORMER_FEATURE_COLUMNS)  # 4: x, y, o_rad, dir_rad
 _ZONE_LABEL = "No_Matchup_Zone"
 
 # Fixed label map: slot_0..slot_4 map to indices 0-4; No_Matchup_Zone → 5.
@@ -157,7 +158,7 @@ class NFLCoverageDataset(Dataset):
         valid = ai_raw.notna().values
         fi_v = fi[valid]
         ai_v = ai_raw[valid].values.astype(np.int32)
-        feature_vals = play_df.loc[valid, FEATURE_COLUMNS].values.astype(np.float32)
+        feature_vals = play_df.loc[valid, TRANSFORMER_FEATURE_COLUMNS].values.astype(np.float32)
         # Use the per-play relative slot column (int8, values 0‥NO_MATCHUP_SLOT).
         # Rows without a valid slot (e.g. NaN from a missing column) fall back to -1.
         raw_slots = play_df.loc[valid, MATCHUP_TARGET_COLUMN]

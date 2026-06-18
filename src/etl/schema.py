@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import FEATURE_COLUMNS
+from src.config import TRANSFORMER_FEATURE_COLUMNS
 
 FEATURE_STORE_SCHEMA: dict[str, str] = {
     "gameId": "int32",
     "playId": "int32",
     "frameId": "int16",
     "defender_nflId": "float64",
-    **{col: "float32" for col in FEATURE_COLUMNS},
+    **{col: "float32" for col in TRANSFORMER_FEATURE_COLUMNS},
     "coverage_label": "object",
     "matchup_slot": "int8",
     "slot_receiver_nflIds": "object",

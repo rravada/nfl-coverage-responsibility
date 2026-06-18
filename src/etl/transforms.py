@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
-    FEATURE_COLUMNS,
     MATCHUP_TARGET_COLUMN,
     MAX_RECEIVERS,
     NAN_FILL_VALUE,
@@ -14,12 +13,25 @@ from src.config import (
     POSITION_MAP,
     POSITION_UNKNOWN_ID,
     SNAP_EVENT,
+    TRANSFORMER_FEATURE_COLUMNS,
 )
 
 _FRAME_KEY: list[str] = ["gameId", "playId", "frameId"]
+_DEFENDER_KEY: list[str] = _FRAME_KEY + ["defender_nflId"]
 _PRESERVE_FLOAT64: frozenset[str] = frozenset(
     {"defender_nflId", "nflId", "pff_primaryDefensiveCoveredReceiverId"}
 )
+
+# Coverage defender positions (same set used in etl_job.py).
+_COVERAGE_POSITIONS: frozenset[str] = frozenset(
+    {"CB", "FS", "SS", "ILB", "OLB", "LB", "MLB", "DB"}
+)
+
+# Eligible offensive skill positions for receiver-slot and nearest-receiver logic.
+_ELIGIBLE_POSITIONS: frozenset[str] = frozenset({"WR", "TE", "RB", "FB"})
+
+# PFF per-defender covered-receiver column (absent in BDB 2023 data; guarded).
+_PFF_RECEIVER_COL: str = "pff_primaryDefensiveCoveredReceiverId"
 
 log = logging.getLogger(__name__)
 
@@ -89,9 +101,9 @@ def downcast_memory(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.select_dtypes(include="float64").columns:
         if col not in _PRESERVE_FLOAT64:
             df[col] = df[col].astype(np.float32)
-    # Feature columns that happen to be int64 (no NaN introduced by left-join)
+    # Transformer feature columns that happen to be int64 (no NaN from left-join)
     # must also become float32 to match the schema.
-    for col in FEATURE_COLUMNS:
+    for col in TRANSFORMER_FEATURE_COLUMNS:
         if col in df.columns and df[col].dtype == np.int64:
             df[col] = df[col].astype(np.float32)
     _INT_CASTS: dict[str, type] = {
@@ -106,6 +118,12 @@ def downcast_memory(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def derive_territory_ratio(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute territory_ratio from territory_area_sq_yd (XGBoost path only).
+
+    No longer called by the transformer ETL; retained for the XGBoost pipeline
+    (train.py / evaluate.py call their own feature functions inline) and for
+    backward compatibility.
+    """
     df = df.copy()
     _frame_total = (
         df.groupby(_FRAME_KEY)["territory_area_sq_yd"].transform("sum")
@@ -147,7 +165,147 @@ def add_position_and_team_ids(
     return df
 
 
-_ELIGIBLE_POSITIONS: frozenset[str] = frozenset({"WR", "TE", "RB", "FB"})
+def derive_assigned_receiver(normalized: pd.DataFrame) -> pd.DataFrame:
+    """Assign each defender-frame the nearest eligible receiver by Euclidean distance.
+
+    Replaces the Voronoi-based ``build_coverage_assignments`` call in the transformer
+    ETL path, computing receiver identity purely from raw tracking coordinates.
+
+    Priority
+    --------
+    1. ``pff_primaryDefensiveCoveredReceiverId`` (play-level PFF annotation) — used
+       when the column is present and non-NaN; broadcast to every frame for that
+       defender on that play.  **No-op on BDB 2023 data** (column absent).
+    2. Nearest eligible receiver (WR / TE / RB / FB on the possessionTeam) at the
+       same frame by Euclidean distance.
+
+    Parameters
+    ----------
+    normalized:
+        Full per-frame tracking DataFrame for one game, produced by
+        ``build_normalized_tracking``.  Must carry ``officialPosition``,
+        ``team``, ``possessionTeam``, ``x``, ``y``.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (gameId, playId, frameId, defender_nflId).  Columns:
+        ``gameId, playId, frameId, defender_nflId, assigned_receiver_nflId``.
+        ``assigned_receiver_nflId`` is NaN where no eligible receiver exists
+        on the play.
+    """
+    # --- Defenders (coverage positions only) ---
+    def_df = (
+        normalized
+        .loc[
+            normalized["officialPosition"].isin(_COVERAGE_POSITIONS),
+            _FRAME_KEY + ["nflId", "x", "y"],
+        ]
+        .rename(columns={"nflId": "defender_nflId", "x": "_def_x", "y": "_def_y"})
+        .reset_index(drop=True)
+    )
+
+    # --- Eligible receivers on the possession team ---
+    rec_df = (
+        normalized
+        .loc[
+            normalized["officialPosition"].isin(_ELIGIBLE_POSITIONS)
+            & (normalized["team"] == normalized["possessionTeam"]),
+            _FRAME_KEY + ["nflId", "x", "y"],
+        ]
+        .rename(columns={"nflId": "receiver_nflId", "x": "_rec_x", "y": "_rec_y"})
+        .reset_index(drop=True)
+    )
+
+    # --- Cross-join per frame: one (defender, receiver) row for each pairing ---
+    cross = def_df.merge(rec_df, on=_FRAME_KEY, how="left")
+    cross["_dist2"] = (cross["_def_x"] - cross["_rec_x"]) ** 2 + (
+        cross["_def_y"] - cross["_rec_y"]
+    ) ** 2
+
+    # Keep the closest receiver per defender-frame.
+    nearest = (
+        cross.sort_values("_dist2")
+        .drop_duplicates(subset=_DEFENDER_KEY, keep="first")
+        [_DEFENDER_KEY + ["receiver_nflId"]]
+        .rename(columns={"receiver_nflId": "assigned_receiver_nflId"})
+        .reset_index(drop=True)
+    )
+
+    # --- Priority-1 PFF override (guarded — no-op when column absent) ---
+    if _PFF_RECEIVER_COL in normalized.columns:
+        pff_recv = (
+            normalized
+            .loc[
+                normalized["officialPosition"].isin(_COVERAGE_POSITIONS)
+                & normalized[_PFF_RECEIVER_COL].notna(),
+                ["gameId", "playId", "nflId", _PFF_RECEIVER_COL],
+            ]
+            .rename(columns={"nflId": "defender_nflId", _PFF_RECEIVER_COL: "_pff_recv"})
+            .drop_duplicates(subset=["gameId", "playId", "defender_nflId"])
+        )
+        # Broadcast the play-level PFF assignment across all frames for that defender.
+        nearest = nearest.merge(
+            pff_recv[["gameId", "playId", "defender_nflId", "_pff_recv"]],
+            on=["gameId", "playId", "defender_nflId"],
+            how="left",
+        )
+        nearest["assigned_receiver_nflId"] = nearest["_pff_recv"].combine_first(
+            nearest["assigned_receiver_nflId"]
+        )
+        nearest = nearest.drop(columns=["_pff_recv"])
+
+    return nearest
+
+
+def derive_coverage_labels(df: pd.DataFrame, plays_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach ``coverage_label`` to each defender-frame row.
+
+    Zone / man determination uses the play-level ``pff_passCoverageType`` column from
+    *plays_df* (``Man`` → man; ``Zone``, ``Other``, or NaN → ``No_Matchup_Zone``).
+    Additionally, any defender-frame with no assigned receiver (``assigned_receiver_nflId``
+    is NaN) is forced to ``No_Matchup_Zone`` regardless of the coverage type.
+
+    ``coverage_label`` values:
+        ``"No_Matchup_Zone"`` — zone coverage, missing annotation, or no receiver.
+        ``str(int(nflId))``   — man coverage: the covered receiver's nflId as string.
+
+    Parameters
+    ----------
+    df:
+        Defender-frame feature DataFrame.  Must contain ``gameId``, ``playId``,
+        and ``assigned_receiver_nflId``.
+    plays_df:
+        Play-context DataFrame (from ``plays.csv``).  Must contain ``gameId``,
+        ``playId``, and ``pff_passCoverageType``.
+    """
+    df = df.copy()
+
+    cov_type = (
+        plays_df[["gameId", "playId", "pff_passCoverageType"]]
+        .drop_duplicates(subset=["gameId", "playId"])
+    )
+    df = df.merge(cov_type, on=["gameId", "playId"], how="left")
+
+    # Non-"man" coverage type (Zone, Other, NaN) → zone.
+    pff_is_zone: pd.Series = (
+        df["pff_passCoverageType"].isna()
+        | ~df["pff_passCoverageType"].str.lower().str.contains("man", na=False)
+    )
+    no_receiver: pd.Series = df["assigned_receiver_nflId"].isna()
+    is_zone: pd.Series = pff_is_zone | no_receiver
+
+    df["coverage_label"] = np.where(
+        is_zone,
+        "No_Matchup_Zone",
+        df["assigned_receiver_nflId"]
+        .dropna()
+        .astype(np.int64)
+        .astype(str)
+        .reindex(df.index, fill_value="No_Matchup_Zone"),
+    )
+    df = df.drop(columns=["pff_passCoverageType"])
+    return df
 
 
 def derive_matchup_slots(
@@ -279,36 +437,4 @@ def derive_matchup_slots(
         lambda v: v if isinstance(v, list) else []
     )
 
-    return df
-
-
-def derive_coverage_labels(df: pd.DataFrame, pff_df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if "pff_coverage" in pff_df.columns:
-        pff_snap = (
-            pff_df[["gameId", "playId", "nflId", "pff_coverage"]]
-            .drop_duplicates(subset=["gameId", "playId", "nflId"])
-            .rename(columns={"nflId": "defender_nflId"})
-        )
-        df = df.merge(pff_snap, on=["gameId", "playId", "defender_nflId"], how="left")
-        pff_is_zone: pd.Series = (
-            df["pff_coverage"].isna()
-            | ~df["pff_coverage"].str.lower().str.contains("man", na=False)
-        )
-    else:
-        pff_is_zone = pd.Series(False, index=df.index)
-
-    no_voronoi: pd.Series = df["assigned_receiver_nflId"].isna()
-    is_zone: pd.Series = pff_is_zone | no_voronoi
-
-    df["coverage_label"] = np.where(
-        is_zone,
-        "No_Matchup_Zone",
-        df["assigned_receiver_nflId"]
-        .dropna()
-        .astype(np.int64)
-        .astype(str)
-        .reindex(df.index, fill_value="No_Matchup_Zone"),
-    )
     return df

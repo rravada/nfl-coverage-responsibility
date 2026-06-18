@@ -1,19 +1,34 @@
 """
 pipelines/etl_job.py
 ====================
-Feature store ETL job. Reads week1.csv once, computes the full defender-centric
-feature matrix per game, and writes partitioned Parquet output to data/feature_store/.
+Feature store ETL job. Reads week*.csv files, computes the raw-kinematic
+defender-centric feature matrix per game (paper §3.3: x, y, o_rad, dir_rad),
+and writes partitioned Parquet output to data/feature_store/.
+
+Receiver-defender matchup labels are derived from:
+  1. pff_primaryDefensiveCoveredReceiverId (guarded; absent in BDB 2023 data)
+  2. Nearest eligible receiver by Euclidean distance (drives all matchups here)
+  Man/zone determination uses plays.csv → pff_passCoverageType.
+
+Week partition is derived from games.csv (games_df["week"]) — not hardcoded.
 
 Usage
 -----
+    # All weeks
     python pipelines/etl_job.py --data-dir data/raw --output-dir data/feature_store
-    python pipelines/etl_job.py --data-dir data/raw --game-ids 2021090900 --log-level DEBUG
+
+    # Specific weeks
+    python pipelines/etl_job.py --data-dir data/raw --weeks 1 2 3
+
+    # Specific games within specific weeks
+    python pipelines/etl_job.py --data-dir data/raw --weeks 1 --game-ids 2021090900
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,12 +47,7 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, SEASON
-from src.coverage_assignment import (
-    build_coverage_assignments,
-    build_field_grid,
-    compute_defender_territories,
-)
+from src.config import NAN_FILL_VALUE, SEASON, TRANSFORMER_FEATURE_COLUMNS
 from src.data.normalizer import (
     build_normalized_tracking,
     load_games,
@@ -52,16 +62,10 @@ from src.etl.transforms import (
     add_position_and_team_ids,
     add_snap_frame_marker,
     apply_nan_sentinel,
+    derive_assigned_receiver,
     derive_coverage_labels,
     derive_matchup_slots,
-    derive_territory_ratio,
     downcast_memory,
-)
-from src.features.coverage_features import (
-    compute_presnap_safety_depth,
-    compute_receiver_cushion,
-    compute_spatial_leverage,
-    compute_velocity_angular_divergence,
 )
 
 _COVERAGE_POSITIONS: frozenset[str] = frozenset(
@@ -69,19 +73,27 @@ _COVERAGE_POSITIONS: frozenset[str] = frozenset(
 )
 _FRAME_KEY: list[str] = ["gameId", "playId", "frameId"]
 _DEFENDER_KEY: list[str] = _FRAME_KEY + ["defender_nflId"]
+_WEEK_RE: re.Pattern[str] = re.compile(r"week(\d+)\.csv", re.IGNORECASE)
 
 log = logging.getLogger(__name__)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Feature store ETL: raw CSVs → partitioned Parquet.",
+        description="Feature store ETL: raw CSVs → partitioned Parquet (4 raw kinematic features).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--data-dir", type=Path, default=Path("data/raw"))
     p.add_argument("--output-dir", type=Path, default=Path("data/feature_store"))
     p.add_argument("--game-ids", nargs="*", type=int, default=None, metavar="GAME_ID")
-    p.add_argument("--grid-resolution", type=float, default=1.0)
+    p.add_argument(
+        "--weeks",
+        nargs="*",
+        type=int,
+        default=None,
+        metavar="WEEK",
+        help="Week numbers to process (e.g. --weeks 1 2 3). Defaults to all week*.csv files found.",
+    )
     p.add_argument(
         "--log-level",
         default="INFO",
@@ -123,7 +135,6 @@ def process_game(
     plays_df: pd.DataFrame,
     games_df: pd.DataFrame,
     pff_df: pd.DataFrame,
-    field_grid: np.ndarray,
     output_dir: Path,
 ) -> dict:
     t0 = time.perf_counter()
@@ -143,6 +154,13 @@ def process_game(
         if "gameId" in games_df.columns else games_df
     )
 
+    # Derive the true week number from games_df (authoritative; not hardcoded).
+    if len(game_games) and "week" in game_games.columns:
+        week = int(game_games["week"].iloc[0])
+    else:
+        log.warning("game=%s: week not found in games_df; defaulting to 1", game_id)
+        week = 1
+
     normalized = build_normalized_tracking(
         tracking_df=slice_raw,
         players_df=players_df,
@@ -155,14 +173,8 @@ def process_game(
         game_id, normalized.shape, normalized["playId"].nunique(),
     )
 
-    assignments = build_coverage_assignments(normalized, grid_xy=field_grid)
-    territory = compute_defender_territories(normalized, grid_xy=field_grid)
-    cushion = compute_receiver_cushion(normalized, fallback_to_nearest=True)
-    leverage = compute_spatial_leverage(normalized, fallback_to_nearest=True)
-    safety = compute_presnap_safety_depth(normalized)
-    vad = compute_velocity_angular_divergence(normalized, fallback_to_nearest=True)
-
-    kine_cols = _FRAME_KEY + ["nflId", "x", "y", "s", "a", "o_rad", "dir_rad"]
+    # --- Defender kinematic base (4 raw features only; paper §3.3) ---
+    kine_cols = _FRAME_KEY + ["nflId", "x", "y", "o_rad", "dir_rad"]
     kine_df = (
         normalized
         .loc[normalized["officialPosition"].isin(_COVERAGE_POSITIONS), kine_cols]
@@ -170,56 +182,16 @@ def process_game(
         .reset_index(drop=True)
     )
 
-    assignments_dedup = (
-        assignments
-        .sort_values("assigned_receiver_nflId")
-        .drop_duplicates(subset=_DEFENDER_KEY, keep="first")
+    # --- Nearest-receiver assignment (no Voronoi; pure Euclidean distance) ---
+    receiver_assignments = derive_assigned_receiver(normalized)
+
+    feature_df = kine_df.merge(
+        receiver_assignments[_DEFENDER_KEY + ["assigned_receiver_nflId"]],
+        on=_DEFENDER_KEY,
+        how="left",
     )
 
-    cushion = cushion.rename(columns={"nflId": "defender_nflId"})
-    leverage = leverage.rename(columns={"nflId": "defender_nflId"})
-    vad = vad.rename(columns={"nflId": "defender_nflId"})
-
-    feature_df = (
-        kine_df
-        .merge(
-            assignments_dedup[_DEFENDER_KEY + ["assigned_receiver_nflId"]],
-            on=_DEFENDER_KEY,
-            how="left",
-        )
-        .merge(
-            territory[_DEFENDER_KEY + ["territory_grid_points", "territory_area_sq_yd"]],
-            on=_DEFENDER_KEY,
-            how="left",
-        )
-    )
-
-    feature_df = derive_territory_ratio(feature_df)
-
-    feature_df = (
-        feature_df
-        .merge(
-            cushion[_DEFENDER_KEY + ["receiver_cushion"]],
-            on=_DEFENDER_KEY,
-            how="left",
-        )
-        .merge(
-            leverage[_DEFENDER_KEY + ["leverage_x", "leverage_y"]],
-            on=_DEFENDER_KEY,
-            how="left",
-        )
-        .merge(
-            vad[_DEFENDER_KEY + ["velocity_angular_divergence"]],
-            on=_DEFENDER_KEY,
-            how="left",
-        )
-        .merge(
-            safety[["gameId", "playId", "safety_depth_mean", "safety_depth_std"]],
-            on=["gameId", "playId"],
-            how="left",
-        )
-    )
-
+    # --- Event column needed for snap marker ---
     event_lookup = (
         normalized
         .groupby(_FRAME_KEY)["event"]
@@ -228,17 +200,24 @@ def process_game(
     )
     feature_df = feature_df.merge(event_lookup, on=_FRAME_KEY, how="left")
 
-    feature_df = derive_coverage_labels(feature_df, pff_df)
+    # --- Labels ---
+    feature_df = derive_coverage_labels(feature_df, game_plays)
     feature_df = derive_matchup_slots(feature_df, normalized, game_plays)
+
+    # --- Metadata ---
     feature_df = add_snap_frame_marker(feature_df)
     feature_df = add_frames_since_snap(feature_df)
     feature_df = add_play_group_key(feature_df)
-    feature_df = apply_nan_sentinel(feature_df, FEATURE_COLUMNS, NAN_FILL_VALUE)
+
+    # Sentinel-fill transformer feature columns only (not the full 15-col XGBoost set).
+    feature_df = apply_nan_sentinel(feature_df, TRANSFORMER_FEATURE_COLUMNS, NAN_FILL_VALUE)
     feature_df = downcast_memory(feature_df)
 
+    # Drop working columns that were needed only for label derivation.
     drop_cols = [c for c in ["event", "assigned_receiver_nflId", "pff_coverage"] if c in feature_df.columns]
     feature_df = feature_df.drop(columns=drop_cols)
 
+    # --- position_id / team_id (needs team column from raw slice) ---
     team_lookup = (
         slice_raw[["nflId", "team"]]
         .drop_duplicates("nflId")
@@ -251,7 +230,13 @@ def process_game(
 
     feature_df = feature_df.sort_values(["playId", "frameId", "defender_nflId"]).reset_index(drop=True)
 
-    out_path = output_dir / f"season={SEASON}" / "week=01" / f"game={game_id}" / "features.parquet"
+    out_path = (
+        output_dir
+        / f"season={SEASON}"
+        / f"week={week:02d}"
+        / f"game={game_id}"
+        / "features.parquet"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     feature_df.to_parquet(out_path, engine="pyarrow", compression="snappy", index=False)
 
@@ -265,12 +250,12 @@ def process_game(
 
     return {
         "season": SEASON,
-        "week": 1,
+        "week": week,
         "gameId": int(game_id),
         "row_count": row_count,
         "n_plays": n_plays,
         "etl_timestamp": datetime.now(timezone.utc).isoformat(),
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
     }
 
 
@@ -281,8 +266,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     log.info("=" * 72)
     log.info("NFL Coverage Responsibility — Feature Store ETL")
     log.info("=" * 72)
-    log.info("config: data_dir=%s output_dir=%s grid_res=%.1f",
-             args.data_dir, args.output_dir, args.grid_resolution)
+    log.info("config: data_dir=%s output_dir=%s", args.data_dir, args.output_dir)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -292,39 +276,64 @@ def main(argv: Optional[list[str]] = None) -> None:
     games_df = load_games(str(args.data_dir / "games.csv"))
     pff_df = load_pff_scouting(str(args.data_dir / "pffScoutingData.csv"))
 
-    log.info("Reading week1.csv...")
-    tracking_full = pd.read_csv(str(args.data_dir / "week1.csv"), low_memory=False)
+    # --- Discover week*.csv files ---
+    all_week_files = sorted(args.data_dir.glob("week*.csv"))
+    week_file_map: dict[int, Path] = {}
+    for wf in all_week_files:
+        m = _WEEK_RE.match(wf.name)
+        if m:
+            week_file_map[int(m.group(1))] = wf
 
-    log.info("Building field grid at %.1f yd resolution...", args.grid_resolution)
-    field_grid = build_field_grid(resolution=args.grid_resolution)
+    if args.weeks:
+        requested = set(args.weeks)
+        week_file_map = {w: p for w, p in week_file_map.items() if w in requested}
+        missing = requested - set(week_file_map)
+        if missing:
+            log.warning("Requested weeks not found: %s", sorted(missing))
 
-    game_ids_in_data = sorted(tracking_full["gameId"].unique())
-    game_ids_to_run = (
-        [g for g in game_ids_in_data if g in args.game_ids]
-        if args.game_ids else game_ids_in_data
+    if not week_file_map:
+        log.warning("No week*.csv files matched. Nothing to process.")
+        return
+
+    log.info(
+        "Processing weeks: %s",
+        ", ".join(str(w) for w in sorted(week_file_map)),
     )
-    log.info("Games to process: %d", len(game_ids_to_run))
 
     manifest_rows: list[dict] = []
 
-    for game_id in game_ids_to_run:
-        log.info("-" * 60)
-        log.info("Processing game=%s ...", game_id)
-        try:
-            row = process_game(
-                game_id=game_id,
-                tracking_full=tracking_full,
-                players_df=players_df,
-                plays_df=plays_df,
-                games_df=games_df,
-                pff_df=pff_df,
-                field_grid=field_grid,
-                output_dir=args.output_dir,
-            )
-            manifest_rows.append(row)
-        except Exception as exc:
-            log.error("game=%s FAILED: %s", game_id, exc, exc_info=True)
-            raise
+    for week_num, week_path in sorted(week_file_map.items()):
+        log.info("=" * 60)
+        log.info("Reading %s ...", week_path.name)
+        tracking_full = pd.read_csv(str(week_path), low_memory=False)
+
+        game_ids_in_data = sorted(tracking_full["gameId"].unique())
+        game_ids_to_run = (
+            [g for g in game_ids_in_data if g in args.game_ids]
+            if args.game_ids else game_ids_in_data
+        )
+        log.info(
+            "Week %d: %d game(s) found in CSV, %d to process",
+            week_num, len(game_ids_in_data), len(game_ids_to_run),
+        )
+
+        for game_id in game_ids_to_run:
+            log.info("-" * 60)
+            log.info("Processing game=%s ...", game_id)
+            try:
+                row = process_game(
+                    game_id=game_id,
+                    tracking_full=tracking_full,
+                    players_df=players_df,
+                    plays_df=plays_df,
+                    games_df=games_df,
+                    pff_df=pff_df,
+                    output_dir=args.output_dir,
+                )
+                manifest_rows.append(row)
+            except Exception as exc:
+                log.error("game=%s FAILED: %s", game_id, exc, exc_info=True)
+                raise
 
     if manifest_rows:
         _update_manifest(

@@ -18,6 +18,10 @@ FEATURE_COLUMNS: list[str] = [
     "territory_ratio",
 ]
 
+# Transformer feature store uses raw kinematics only (paper §3.3 — the attention
+# mechanism learns spatial relationships from coordinates directly; no derived features).
+TRANSFORMER_FEATURE_COLUMNS: list[str] = ["x", "y", "o_rad", "dir_rad"]
+
 TARGET_COLUMN: str = "coverage_label"
 TRAIN_HASH_THRESHOLD: float = 0.80
 NAN_FILL_VALUE: float = -999.0

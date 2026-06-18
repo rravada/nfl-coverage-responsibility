@@ -3,17 +3,22 @@ Factorized attention transformer for per-frame, per-agent coverage matchup
 classification (AWS/NGS architecture, arxiv:2603.25901).
 
 The model consumes the padded per-play tensors emitted by NFLCoverageDataset
-(features (B, T, A, 15), agent_mask (B, T, A) bool) and produces frame-by-frame
-class logits (B, T, A, num_classes). Attention is factorized into a temporal pass
-(across frames, per agent) and an agent pass (across agents, per frame), so the
-cost is O(T^2 + A^2) per layer instead of O((T*A)^2).
+(features (B, T, A, 4), agent_mask (B, T, A) bool) and produces per-agent
+class logits (B, A, num_classes) after temporal mean-pooling.  Attention is
+factorized into a temporal pass (across frames, per agent) and an agent pass
+(across agents, per frame), so the cost is O(T^2 + A^2) per layer instead of
+O((T*A)^2).
+
+Input feature dimension is 4 (x, y, o_rad, dir_rad) — raw kinematics only,
+as per §3.3 of the paper.  The attention mechanism learns spatial relationships
+from raw coordinates directly; no Voronoi / cushion / leverage features.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from src.config import FEATURE_COLUMNS, NAN_FILL_VALUE, NUM_POSITION_CLASSES, NUM_TEAM_CLASSES  # noqa: F401  (sentinel intent)
+from src.config import NAN_FILL_VALUE, NUM_POSITION_CLASSES, NUM_TEAM_CLASSES, TRANSFORMER_FEATURE_COLUMNS  # noqa: F401  (sentinel intent)
 
 
 class FactorizedAttentionBlock(nn.Module):
@@ -79,7 +84,7 @@ class CoverageMatchupTransformer(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.input_proj = nn.Linear(len(FEATURE_COLUMNS), d_model)
+        self.input_proj = nn.Linear(len(TRANSFORMER_FEATURE_COLUMNS), d_model)  # 4 → d_model
         self.blocks = nn.ModuleList(
             [
                 FactorizedAttentionBlock(d_model, num_heads, dropout)
@@ -92,7 +97,7 @@ class CoverageMatchupTransformer(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,      # (B, T, A, 15)
+        features: torch.Tensor,      # (B, T, A, 4)
         agent_mask: torch.Tensor,    # (B, T, A) bool
         position_ids: torch.Tensor,  # (B, A) int64
         team_ids: torch.Tensor,      # (B, A) int64
