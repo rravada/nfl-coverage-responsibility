@@ -10,9 +10,15 @@ The partition layout mirrors the S3 structure that will replace the local prefix
 in a later task; the inference logic here is intended to remain unchanged.
 
 The transformer mean-pools over time, producing one probability distribution per
-agent slot per play. Each output file therefore has one row per agent slot that
-is present in at least one frame — columns are nflId plus one float32 column per
-class in the checkpoint's label_map. No frameId column, no ground-truth column.
+agent slot per play. Each output file therefore has one row per DEFENSIVE agent
+slot that is present in at least one frame — columns are nflId plus one float32
+column per class in the checkpoint's label_map. No frameId column, no
+ground-truth column.
+
+The feature-store agent set also includes possession-team offensive players
+(WR/TE/RB/FB/QB) so the model can see receiver positions, but they are never a
+coverage-responsibility target themselves; prediction rows are written for
+defensive agents only (team_id == 1).
 """
 from __future__ import annotations
 
@@ -96,7 +102,10 @@ def _predict_play(
     2. Softmax over the masked 6-class logit vector.
     3. Re-expand: slot i → str(slotReceiverIds[i]); NO_MATCHUP_SLOT → "No_Matchup_Zone".
     4. Renormalise the kept columns to sum to exactly 1.0.
-    5. Output one row per present defender, columns = receiver nflId strings + no-matchup.
+    5. Output one row per present DEFENSIVE agent (team_id == 1) — offensive
+       agents (WR/TE/RB/FB/QB) are in the tensors so attention can see receiver
+       positions, but they have no coverage-responsibility target and are
+       dropped from the output.
     """
     num_eligible: int = item["meta"]["numEligible"]
     slot_receiver_ids: list = item["meta"]["slotReceiverIds"]
@@ -105,9 +114,10 @@ def _predict_play(
     agent_mask_t = item["agent_mask"].unsqueeze(0).to(device)
     position_ids = item["position_ids"].unsqueeze(0).to(device)
     team_ids = item["team_ids"].unsqueeze(0).to(device)
+    slot_ids = item["slot_ids"].unsqueeze(0).to(device)
 
     with torch.no_grad():
-        logits = model(features, agent_mask_t, position_ids, team_ids)  # (1, A, C)
+        logits = model(features, agent_mask_t, position_ids, team_ids, slot_ids)  # (1, A, C)
 
         # Mask empty receiver slots — same masking applied during training.
         C = logits.size(-1)
@@ -121,6 +131,14 @@ def _predict_play(
 
     agent_mask = item["agent_mask"].numpy()                              # (T, A) bool
     a_idx = np.where(agent_mask.any(axis=0))[0]
+    if a_idx.size == 0:
+        return None
+
+    # Restrict output rows to defensive agents (team_id == 1). Offensive
+    # agents are only present so the attention mechanism can see receiver
+    # positions — predictions for them are meaningless.
+    team_ids_np = item["team_ids"].numpy()                               # (A,)
+    a_idx = a_idx[team_ids_np[a_idx] == 1]
     if a_idx.size == 0:
         return None
 

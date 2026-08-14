@@ -10,6 +10,8 @@ from src.config import (
     MAX_RECEIVERS,
     NAN_FILL_VALUE,
     NO_MATCHUP_SLOT,
+    PASS_ARRIVAL_EVENT,
+    PASS_FORWARD_EVENT,
     POSITION_MAP,
     POSITION_UNKNOWN_ID,
     SNAP_EVENT,
@@ -67,6 +69,23 @@ def apply_nan_sentinel(
 def add_snap_frame_marker(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["is_snap_frame"] = df["event"] == SNAP_EVENT
+    return df
+
+
+def add_pass_event_markers(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark pass_forward and pass_arrival frames (paper §3.3 event landmarks).
+
+    Adds two boolean columns derived from the ``event`` column:
+      ``is_pass_forward_frame`` — frame where the QB releases the ball.
+      ``is_pass_arrival_frame`` — frame where the ball reaches the receiver.
+
+    Uses literal event-string matching only (no auto-event fallback) to stay
+    faithful to the paper's event-landmark definitions.  The ``event`` column
+    must be present in *df* before this is called (merge it in first).
+    """
+    df = df.copy()
+    df["is_pass_forward_frame"] = df["event"] == PASS_FORWARD_EVENT
+    df["is_pass_arrival_frame"] = df["event"] == PASS_ARRIVAL_EVENT
     return df
 
 

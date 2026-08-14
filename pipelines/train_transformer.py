@@ -104,6 +104,10 @@ def _compute_class_weights(
     weights = torch.zeros(num_classes, dtype=torch.float32)
     nonzero = counts > 0
     weights[nonzero] = total_valid / (num_classes * counts[nonzero].float())
+    # Uncapped inverse-frequency gives rare man slots 10-50x the zone weight,
+    # pushing the model to over-predict man and collapse below the zone base
+    # rate (diagnosed 2026-07: val_acc 0.145 vs ~0.70 base rate).
+    weights = weights.clamp(max=5.0)
     return weights.to(device)
 
 
@@ -135,8 +139,9 @@ def _run_epoch(
             agent_mask = batch["agent_mask"].to(device)
             position_ids = batch["position_ids"].to(device)
             team_ids = batch["team_ids"].to(device)
+            slot_ids = batch["slot_ids"].to(device)
 
-            logits = model(features, agent_mask, position_ids, team_ids)  # (B, A, C)
+            logits = model(features, agent_mask, position_ids, team_ids, slot_ids)  # (B, A, C)
 
             # Mask receiver slots that are empty for this play to -1e9 so the
             # head cannot put probability mass on non-existent receivers.
@@ -202,8 +207,11 @@ def main() -> None:
     train_paths, val_paths = _split_games(game_id_to_path, args.smoke_test)
     log.info("Train games: %d | Val games: %d", len(train_paths), len(val_paths))
 
-    train_ds = NFLCoverageDataset(train_paths, label_map=None, truncate=True)
-    val_ds = NFLCoverageDataset(val_paths, label_map=train_ds.label_map, truncate=False)
+    # require_events=True applies the paper's §3.3 play filter: drop plays that
+    # lack a snap or pass_forward event (sacks, scrambles — off-task plays where
+    # the forward/arrival truncation windows are undefined).
+    train_ds = NFLCoverageDataset(train_paths, label_map=None, truncate=True, require_events=True)
+    val_ds = NFLCoverageDataset(val_paths, label_map=train_ds.label_map, truncate=False, require_events=True)
     log.info("Train plays: %d | Val plays: %d", len(train_ds), len(val_ds))
 
     train_loader = DataLoader(
@@ -234,7 +242,9 @@ def main() -> None:
         final_div_factor=100.0,
     )
 
-    best_val_acc = float("-inf")
+    # Checkpoint on val_loss: with class-weighted CE, val_acc is dominated by
+    # the zone class and peaks misleadingly in barely-trained early epochs.
+    best_val_loss = float("inf")
     checkpoint_path = models_dir / "transformer_best.pt"
 
     for epoch in range(1, epochs + 1):
@@ -248,8 +258,8 @@ def main() -> None:
             "Epoch %d/%d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f | lr=%.2e",
             epoch, epochs, train_loss, val_loss, val_acc, lr,
         )
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save(
                 {
                     "epoch": epoch,
@@ -263,9 +273,9 @@ def main() -> None:
                 },
                 checkpoint_path,
             )
-            log.info("Checkpoint saved (val_acc=%.4f)", val_acc)
+            log.info("Checkpoint saved (val_loss=%.4f, val_acc=%.4f)", val_loss, val_acc)
 
-    log.info("Training complete. Best val_acc=%.4f", best_val_acc)
+    log.info("Training complete. Best val_loss=%.4f", best_val_loss)
 
 
 if __name__ == "__main__":

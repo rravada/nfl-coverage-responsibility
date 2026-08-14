@@ -2,19 +2,27 @@
 NFLCoverageDataset — PyTorch Dataset for the factorized attention transformer
 (AWS/NGS architecture, arxiv:2603.25901).
 
-Each sample is one play. __getitem__ returns a dict with six keys:
+Each sample is one play. __getitem__ returns a dict with seven keys:
 
-    features     float32  (MAX_FRAMES, MAX_AGENTS, 4)
-                          4 raw kinematic features: x, y, o_rad, dir_rad.
-                          Padded with NAN_FILL_VALUE where no defender is present.
+    features     float32  (MAX_FRAMES, MAX_AGENTS, 5)
+                          5 raw kinematic features: x, y, o_rad, dir_rad, and
+                          frames_since_snap/10 (seconds since snap; negative
+                          pre-snap is fine). Padded with NAN_FILL_VALUE where
+                          no agent is present.
     labels       int64    (MAX_FRAMES, MAX_AGENTS)
-                          -1 where padded, unknown label, or no defender.
+                          -1 where padded, unknown label, or a non-defender
+                          (offensive) agent — offensive agents are visible to
+                          attention but are never a coverage target.
     agent_mask   bool     (MAX_FRAMES, MAX_AGENTS)
-                          True only where a real defender row exists.
+                          True only where a real agent row exists.
     position_ids int64    (MAX_AGENTS,)  one position_id per agent slot;
                           padded slots → POSITION_UNKNOWN_ID.
     team_ids     int64    (MAX_AGENTS,)  one team_id per agent slot (0=offense,
                           1=defense); padded slots → 0.
+    slot_ids     int64    (MAX_AGENTS,)  index 0..MAX_RECEIVERS-1 if this agent
+                          IS that play's i-th eligible receiver (left-to-right
+                          at snap); NO_SLOT_ID for every other agent
+                          (defenders, QB, and padded slots).
     meta         dict     gameId (int), playId (int),
                           frameIds (np.int32, real frames only),
                           defenderIds (np.float64, real agents only)
@@ -23,28 +31,31 @@ Agent slot assignment: the union of all defender_nflIds across every frame in th
 play is sorted ascending and assigned slot indices 0…A-1. The same agent occupies
 the same slot in every frame; absent-agent slots for a given frame remain padded.
 
-Truncation strategies (selected randomly in training mode, always 0 in inference):
+Truncation strategy (paper Appendix A.1, Song et al. 2025):
 
-    0   Full play
-    1   Pre-snap: frames 0 through snap (inclusive)
-    2   Snap frame only (single frame)
-    3   Post-snap, keep 10 % of post-snap frames (ceil, min 1)
-    4   Post-snap, keep 20 %
-    5   Post-snap, keep 30 %
-    6   Post-snap, keep 40 %
-    7   Post-snap, keep 50 %
-    8   Post-snap, keep 60 %
-    9   Post-snap, keep 70 %
-    10  Post-snap through pass arrival: slice [snap+1, pass_arrival+1)
-        Pass arrival = frame where frames_since_snap is maximum and > 0.
-        Falls back to full play when snap or pass-arrival index is absent.
+  Training uses a 60/40 split between fixed windows and a truly-random window:
 
-Strategies 1, 2, 3–9 fall back to (0, T) when snap_local_idx == -1.
-Strategies 3–9 fall back to (snap, snap+1) when n_post == 0.
+  60 % FIXED — one of 11 fixed (start, end) windows, each defined by a
+  (pre_snap_offset, end_landmark) pair:
+      start ∈ {snap−30, snap−20, snap−10, snap}   (frames at 10 Hz)
+      end   ∈ {snap, pass_forward, pass_arrival}
+      minus the degenerate (snap, snap) case → 11 windows total.
+
+  40 % RANDOM — start and end both sampled uniformly in [snap−30, pass_arrival].
+
+  "pass_arrival" = pass_arrived event when present, else pass_forward (Option A).
+  This fallback is justified by ≤2pt accuracy difference in the paper's own tables
+  and the ~0.5s gap between events in BDB-2023 data (only 4.3% have pass_arrived).
+
+  Play filter (require_events=True, used for train/val only):
+      Drop plays lacking a snap or pass_forward event.  These are sacks and
+      scrambles where arrival/forward windows are undefined (paper §3.3).
+      Inference keeps all plays (require_events=False, full sequence).
+
+Inference / val: always uses the full available sequence (start=0, end=T).
 """
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,13 +74,19 @@ from src.config import (
     MAX_RECEIVERS,
     NAN_FILL_VALUE,
     NO_MATCHUP_SLOT,
+    NO_SLOT_ID,
     NUM_MATCHUP_CLASSES,
     POSITION_UNKNOWN_ID,
+    PRE_SNAP_OFFSETS,
+    PRE_SNAP_WINDOW,
     TARGET_COLUMN,
+    TIME_FEATURE_COLUMN,
     TRANSFORMER_FEATURE_COLUMNS,
+    TRANSFORMER_INPUT_DIM,
+    TRUNCATION_FIXED_PROB,
 )
 
-_N_FEATURES = len(TRANSFORMER_FEATURE_COLUMNS)  # 4: x, y, o_rad, dir_rad
+_N_FEATURES = TRANSFORMER_INPUT_DIM  # 5: x, y, o_rad, dir_rad, frames_since_snap/10
 _ZONE_LABEL = "No_Matchup_Zone"
 
 # Fixed label map: slot_0..slot_4 map to indices 0-4; No_Matchup_Zone → 5.
@@ -81,6 +98,24 @@ _FIXED_LABEL_MAP: dict[str, int] = {
 }
 _FIXED_LABEL_MAP[_ZONE_LABEL] = NO_MATCHUP_SLOT
 
+# 11 fixed (start_offset, end_marker) strategies from paper Appendix A.1.
+# start_offset is relative to snap (frames); end_marker is one of:
+#   "snap"     → snap frame (inclusive end)
+#   "forward"  → pass_forward frame
+#   "arrival"  → pass_arrival frame (or pass_forward via Option A fallback)
+# The degenerate (offset=0, end="snap") case is intentionally excluded.
+_FIXED_STRATEGIES: list[tuple[int, str]] = [
+    # start = 30 frames before snap
+    (-30, "snap"), (-30, "forward"), (-30, "arrival"),
+    # start = 20 frames before snap
+    (-20, "snap"), (-20, "forward"), (-20, "arrival"),
+    # start = 10 frames before snap
+    (-10, "snap"), (-10, "forward"), (-10, "arrival"),
+    # start = snap (degenerate snap→snap excluded → only 2 remain)
+    (0, "forward"), (0, "arrival"),
+]
+assert len(_FIXED_STRATEGIES) == 11, "Paper Appendix A.1 requires exactly 11 fixed strategies"
+
 
 @dataclass(frozen=True)
 class _PlayData:
@@ -89,12 +124,14 @@ class _PlayData:
     presence_mask: np.ndarray        # (T, A) bool
     n_frames: int
     n_agents: int
-    snap_local_idx: int              # -1 if absent
-    pass_arrival_local_idx: int      # -1 if absent
+    snap_local_idx: int              # local frame index of ball_snap; -1 if absent
+    pass_forward_local_idx: int      # local frame index of pass_forward; -1 if absent
+    pass_arrival_local_idx: int      # local frame index of pass_arrival (Option A); -1 if absent
     frame_ids: np.ndarray            # (T,) int32
     agent_ids: np.ndarray            # (A,) float64
     position_ids: np.ndarray         # (A,) int64
     team_ids: np.ndarray             # (A,) int64
+    slot_ids: np.ndarray             # (A,) int64 — 0..MAX_RECEIVERS-1 or NO_SLOT_ID
     game_id: int
     play_id: int
     slot_receiver_ids: list          # ordered list[int] of eligible receiver nflIds
@@ -108,7 +145,22 @@ class NFLCoverageDataset(Dataset):
         parquet_paths: list[Path],
         label_map: dict[str, int] | None,
         truncate: bool,
+        require_events: bool = False,
     ) -> None:
+        """
+        Parameters
+        ----------
+        parquet_paths:
+            Feature-store Parquet files to load (one per game).
+        label_map:
+            Accepted for API compatibility; the canonical fixed map is always used.
+        truncate:
+            True → apply paper's 60/40 fixed/random truncation (training).
+            False → full sequence for every play (val / inference).
+        require_events:
+            True → drop plays where snap or pass_forward event is missing.
+            Use True for train/val; False for inference (paper §3.3 filter).
+        """
         self.truncate = truncate
         # label_map is fixed and play-relative; any caller-supplied map is
         # accepted for API compatibility but the canonical map is always used.
@@ -127,6 +179,20 @@ class NFLCoverageDataset(Dataset):
             self.plays.append(
                 self._build_play_arrays(play_df, int(game_id), int(play_id))
             )
+
+        if require_events:
+            n_before = len(self.plays)
+            self.plays = [
+                p for p in self.plays
+                if p.snap_local_idx != -1 and p.pass_forward_local_idx != -1
+            ]
+            n_dropped = n_before - len(self.plays)
+            if n_dropped:
+                import logging
+                logging.getLogger(__name__).info(
+                    "require_events: dropped %d/%d plays missing snap or pass_forward",
+                    n_dropped, n_before,
+                )
 
     # ------------------------------------------------------------------
     # Per-play pre-computation
@@ -159,6 +225,12 @@ class NFLCoverageDataset(Dataset):
         fi_v = fi[valid]
         ai_v = ai_raw[valid].values.astype(np.int32)
         feature_vals = play_df.loc[valid, TRANSFORMER_FEATURE_COLUMNS].values.astype(np.float32)
+        # Time-since-snap channel: seconds since snap (negative pre-snap is fine).
+        time_raw = pd.to_numeric(
+            play_df.loc[valid, TIME_FEATURE_COLUMN], errors="coerce"
+        ).to_numpy(dtype=np.float32)
+        time_vals = (np.nan_to_num(time_raw, nan=0.0) / 10.0).astype(np.float32).reshape(-1, 1)
+        feature_vals = np.concatenate([feature_vals, time_vals], axis=1)
         # Use the per-play relative slot column (int8, values 0‥NO_MATCHUP_SLOT).
         # Rows without a valid slot (e.g. NaN from a missing column) fall back to -1.
         raw_slots = play_df.loc[valid, MATCHUP_TARGET_COLUMN]
@@ -174,13 +246,30 @@ class NFLCoverageDataset(Dataset):
         else:
             snap_local_idx = -1
 
-        # --- pass arrival detection ---
-        fss = play_df.groupby("frameId")["frames_since_snap"].first()
-        candidates = fss[fss > 0]
-        if candidates.empty:
-            pass_arrival_local_idx = -1
+        # --- pass_forward detection ---
+        if "is_pass_forward_frame" in play_df.columns:
+            fwd_rows = play_df[play_df["is_pass_forward_frame"]]
+            if len(fwd_rows):
+                pass_forward_local_idx = frame_id_map[fwd_rows["frameId"].iloc[0]]
+            else:
+                pass_forward_local_idx = -1
         else:
-            pass_arrival_local_idx = frame_id_map[candidates.idxmax()]
+            pass_forward_local_idx = -1
+
+        # --- pass_arrival detection (Option A: fall back to pass_forward) ---
+        if "is_pass_arrival_frame" in play_df.columns:
+            arr_rows = play_df[play_df["is_pass_arrival_frame"]]
+            if len(arr_rows):
+                pass_arrival_local_idx = frame_id_map[arr_rows["frameId"].iloc[0]]
+            elif pass_forward_local_idx != -1:
+                # Option A: pass_arrived absent → use pass_forward as proxy.
+                # Justified by ≤2pt accuracy gap and ~0.5s event spacing.
+                pass_arrival_local_idx = pass_forward_local_idx
+            else:
+                pass_arrival_local_idx = -1
+        else:
+            # Column absent (old feature store): Option A unconditionally.
+            pass_arrival_local_idx = pass_forward_local_idx
 
         # --- per-agent position and team ids (first valid frame per agent) ---
         agent_meta = (
@@ -208,6 +297,16 @@ class NFLCoverageDataset(Dataset):
                     slot_receiver_ids = []
         num_eligible = len(slot_receiver_ids)
 
+        # --- slot_ids: which agents ARE this play's eligible receivers ---
+        # ≤ MAX_RECEIVERS entries, so a small Python loop is fine (no per-frame
+        # or per-defender loop; this runs once per play over ≤ MAX_RECEIVERS ids).
+        slot_id_lookup = {nid: i for i, nid in enumerate(slot_receiver_ids)}
+        slot_ids_arr = np.fromiter(
+            (slot_id_lookup.get(int(nid), NO_SLOT_ID) for nid in agent_ids),
+            dtype=np.int64,
+            count=A,
+        )
+
         return _PlayData(
             feature_array=feature_array,
             label_array=label_array,
@@ -215,11 +314,13 @@ class NFLCoverageDataset(Dataset):
             n_frames=T,
             n_agents=A,
             snap_local_idx=snap_local_idx,
+            pass_forward_local_idx=pass_forward_local_idx,
             pass_arrival_local_idx=pass_arrival_local_idx,
             frame_ids=frame_ids,
             agent_ids=agent_ids,
             position_ids=position_ids_arr,
             team_ids=team_ids_arr,
+            slot_ids=slot_ids_arr,
             game_id=game_id,
             play_id=play_id,
             slot_receiver_ids=slot_receiver_ids,
@@ -227,49 +328,56 @@ class NFLCoverageDataset(Dataset):
         )
 
     # ------------------------------------------------------------------
-    # Truncation
+    # Truncation (paper Appendix A.1)
     # ------------------------------------------------------------------
 
-    def _get_frame_slice(self, play: _PlayData, strategy: int) -> tuple[int, int]:
-        T = play.n_frames
+    def _fixed_slice(self, play: _PlayData, strategy_idx: int) -> tuple[int, int]:
+        """Return (start, end) for one of the 11 fixed landmark windows."""
         snap = play.snap_local_idx
-        pass_arr = play.pass_arrival_local_idx
+        fwd = play.pass_forward_local_idx
+        arr = play.pass_arrival_local_idx  # already Option A fallback
 
-        if strategy == 0:
-            return 0, T
+        if snap == -1 or fwd == -1:
+            # Fallback: shouldn't occur after require_events filter.
+            return 0, play.n_frames
 
-        if strategy == 1:
-            if snap == -1:
-                return 0, T
-            return 0, snap + 1
+        offset, end_marker = _FIXED_STRATEGIES[strategy_idx]
 
-        if strategy == 2:
-            if snap == -1:
-                return 0, T
-            return snap, snap + 1
+        # Start: snap + offset (offset ≤ 0), clamped to [0, T-1].
+        start = max(0, snap + offset)
 
-        if 3 <= strategy <= 9:
-            if snap == -1:
-                return 0, T
-            post_start = snap + 1
-            n_post = T - post_start
-            if n_post == 0:
-                return snap, snap + 1
-            pct = (strategy - 2) * 0.1
-            n_keep = max(1, math.ceil(n_post * pct))
-            n_keep = min(n_keep, n_post)
-            return post_start, post_start + n_keep
+        # End: inclusive landmark → exclusive slice index.
+        if end_marker == "snap":
+            end = snap + 1
+        elif end_marker == "forward":
+            end = fwd + 1
+        else:  # "arrival"
+            end = (arr if arr != -1 else fwd) + 1
 
-        if strategy == 10:
-            if snap == -1 or pass_arr == -1:
-                return 0, T
-            start = snap + 1
-            end = pass_arr + 1
-            if start >= end:
-                return 0, T
-            return start, end
+        end = min(end, play.n_frames)
+        # Guarantee at least a 1-frame window.
+        if start >= end:
+            start = max(0, end - 1)
 
-        return 0, T
+        return start, end
+
+    def _random_slice(self, play: _PlayData) -> tuple[int, int]:
+        """Return (start, end) sampled uniformly within [snap−30, pass_arrival]."""
+        snap = play.snap_local_idx
+        arr = play.pass_arrival_local_idx  # already Option A fallback
+
+        if snap == -1 or arr == -1:
+            return 0, play.n_frames
+
+        lo = max(0, snap - PRE_SNAP_WINDOW)
+        hi = min(arr, play.n_frames - 1)
+
+        if lo > hi:
+            return 0, play.n_frames
+
+        a = random.randint(lo, hi)
+        b = random.randint(a, hi)
+        return a, b + 1  # exclusive end
 
     # ------------------------------------------------------------------
     # Dataset protocol
@@ -280,9 +388,21 @@ class NFLCoverageDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         play = self.plays[idx]
-        strategy = random.randint(0, 10) if self.truncate else 0
-        start, end = self._get_frame_slice(play, strategy)
-        T_s = end - start
+
+        if self.truncate:
+            # 60% fixed (uniform over 11 strategies), 40% truly random.
+            if random.random() < TRUNCATION_FIXED_PROB:
+                i = random.randint(0, len(_FIXED_STRATEGIES) - 1)
+                start, end = self._fixed_slice(play, i)
+            else:
+                start, end = self._random_slice(play)
+        else:
+            # Val / inference: full available sequence.
+            start, end = 0, play.n_frames
+
+        # Cap to MAX_FRAMES: plays longer than the capacity limit are truncated
+        # from the start of the requested window.
+        T_s = min(end - start, MAX_FRAMES)
         A = play.n_agents
 
         features = np.full(
@@ -291,14 +411,16 @@ class NFLCoverageDataset(Dataset):
         labels = np.full((MAX_FRAMES, MAX_AGENTS), -1, dtype=np.int64)
         agent_mask = np.zeros((MAX_FRAMES, MAX_AGENTS), dtype=bool)
 
-        features[:T_s, :A, :] = play.feature_array[start:end]
-        labels[:T_s, :A] = play.label_array[start:end]
-        agent_mask[:T_s, :A] = play.presence_mask[start:end]
+        features[:T_s, :A, :] = play.feature_array[start:start + T_s]
+        labels[:T_s, :A] = play.label_array[start:start + T_s]
+        agent_mask[:T_s, :A] = play.presence_mask[start:start + T_s]
 
         position_ids_out = np.full(MAX_AGENTS, POSITION_UNKNOWN_ID, dtype=np.int64)
         team_ids_out = np.zeros(MAX_AGENTS, dtype=np.int64)
+        slot_ids_out = np.full(MAX_AGENTS, NO_SLOT_ID, dtype=np.int64)
         position_ids_out[:A] = play.position_ids
         team_ids_out[:A] = play.team_ids
+        slot_ids_out[:A] = play.slot_ids
 
         return {
             "features": torch.from_numpy(features),
@@ -306,10 +428,11 @@ class NFLCoverageDataset(Dataset):
             "agent_mask": torch.from_numpy(agent_mask),
             "position_ids": torch.from_numpy(position_ids_out),
             "team_ids": torch.from_numpy(team_ids_out),
+            "slot_ids": torch.from_numpy(slot_ids_out),
             "meta": {
                 "gameId": play.game_id,
                 "playId": play.play_id,
-                "frameIds": play.frame_ids[start:end],
+                "frameIds": play.frame_ids[start:start + T_s],
                 "defenderIds": play.agent_ids,
                 "slotReceiverIds": play.slot_receiver_ids,
                 "numEligible": play.num_eligible,

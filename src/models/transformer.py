@@ -3,22 +3,59 @@ Factorized attention transformer for per-frame, per-agent coverage matchup
 classification (AWS/NGS architecture, arxiv:2603.25901).
 
 The model consumes the padded per-play tensors emitted by NFLCoverageDataset
-(features (B, T, A, 4), agent_mask (B, T, A) bool) and produces per-agent
+(features (B, T, A, 5), agent_mask (B, T, A) bool) and produces per-agent
 class logits (B, A, num_classes) after temporal mean-pooling.  Attention is
 factorized into a temporal pass (across frames, per agent) and an agent pass
 (across agents, per frame), so the cost is O(T^2 + A^2) per layer instead of
 O((T*A)^2).
 
-Input feature dimension is 4 (x, y, o_rad, dir_rad) — raw kinematics only,
-as per §3.3 of the paper.  The attention mechanism learns spatial relationships
+Input feature dimension is 5 (x, y, o_rad, dir_rad, frames_since_snap/10) —
+raw kinematics plus a time-since-snap channel; see §3.3 of the paper for the
+kinematic features.  The attention mechanism learns spatial relationships
 from raw coordinates directly; no Voronoi / cushion / leverage features.
+
+Agents include BOTH coverage-position defenders and possession-team
+offensive skill players (WR/TE/RB/FB/QB) — the model needs to see receiver
+positions to learn matchup assignments; offensive agents are never a
+coverage-responsibility target themselves (their label is -1, ignored by the
+training loss).
+
+All identity/role information is injected at the INPUT, before any attention
+block: a fixed sinusoidal temporal positional encoding (broadcast over
+agents) plus per-agent position/team/slot embeddings (broadcast over time).
+This lets the attention layers actually distinguish frame order and player
+role while attending; nothing is added after pooling.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
 
-from src.config import NAN_FILL_VALUE, NUM_POSITION_CLASSES, NUM_TEAM_CLASSES, TRANSFORMER_FEATURE_COLUMNS  # noqa: F401  (sentinel intent)
+from src.config import (
+    MAX_FRAMES,
+    MAX_RECEIVERS,
+    NAN_FILL_VALUE,
+    NUM_POSITION_CLASSES,
+    NUM_TEAM_CLASSES,
+    TRANSFORMER_INPUT_DIM,
+)
+
+
+def _sinusoidal_positional_encoding(max_len: int, d_model: int) -> torch.Tensor:
+    """Standard fixed sinusoidal transformer positional encoding (Vaswani et al. 2017).
+
+    Returns a (max_len, d_model) tensor; row t is the encoding for frame index t.
+    """
+    position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)          # (max_len, 1)
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+    )
+    pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
 
 
 class FactorizedAttentionBlock(nn.Module):
@@ -49,21 +86,29 @@ class FactorizedAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor, agent_mask: torch.Tensor) -> torch.Tensor:
         B, T, A, d_model = x.shape
 
+        # Rows whose keys are ALL padded (padding agent slots in the temporal
+        # pass; frames beyond the play's length in the agent pass) would softmax
+        # over all -inf and emit NaN. The NaN itself is masked out downstream,
+        # but its BACKWARD pass poisons parameter gradients (NaN * 0 = NaN in the
+        # attention matmuls), which then get zeroed wholesale — silently freezing
+        # input_proj and the attention projections at their random init. Unmask
+        # such rows entirely instead: they produce finite garbage that never
+        # reaches the loss (excluded at pooling / labelled -1), and gradients
+        # through them are exactly zero.
+
         # --- temporal attention: attend across frames, independently per agent ---
         x_t = x.permute(0, 2, 1, 3).reshape(B * A, T, d_model)
         kpm_t = (~agent_mask).permute(0, 2, 1).reshape(B * A, T)
+        kpm_t = kpm_t & ~kpm_t.all(dim=1, keepdim=True)
         out, _ = self.temporal_attn(x_t, x_t, x_t, key_padding_mask=kpm_t)
-        # Fully padded sequences (padding agent slots) yield NaN; zero them — these
-        # positions are masked / labelled -1 downstream, so this is inert.
-        out = torch.nan_to_num(out, nan=0.0)
         out = out.reshape(B, A, T, d_model).permute(0, 2, 1, 3)
         x = self.norm1(x + self.dropout(out))
 
         # --- agent attention: attend across agents, independently per frame ---
         x_a = x.reshape(B * T, A, d_model)
         kpm_a = (~agent_mask).reshape(B * T, A)
+        kpm_a = kpm_a & ~kpm_a.all(dim=1, keepdim=True)
         out, _ = self.agent_attn(x_a, x_a, x_a, key_padding_mask=kpm_a)
-        out = torch.nan_to_num(out, nan=0.0)
         out = out.reshape(B, T, A, d_model)
         x = self.norm2(x + self.dropout(out))
 
@@ -84,7 +129,7 @@ class CoverageMatchupTransformer(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.input_proj = nn.Linear(len(TRANSFORMER_FEATURE_COLUMNS), d_model)  # 4 → d_model
+        self.input_proj = nn.Linear(TRANSFORMER_INPUT_DIM, d_model)  # 5 → d_model
         self.blocks = nn.ModuleList(
             [
                 FactorizedAttentionBlock(d_model, num_heads, dropout)
@@ -93,18 +138,37 @@ class CoverageMatchupTransformer(nn.Module):
         )
         self.position_embedding = nn.Embedding(NUM_POSITION_CLASSES, d_model)
         self.team_embedding = nn.Embedding(NUM_TEAM_CLASSES, d_model)
+        self.slot_embedding = nn.Embedding(MAX_RECEIVERS + 1, d_model)  # + NO_SLOT_ID
+        # Fixed (non-learned) sinusoidal temporal positional encoding, broadcast
+        # over agents. persistent=False: deterministic, no need to checkpoint.
+        self.register_buffer(
+            "temporal_pe", _sinusoidal_positional_encoding(MAX_FRAMES, d_model), persistent=False
+        )
         self.output_head = nn.Linear(d_model, num_classes)
 
     def forward(
         self,
-        features: torch.Tensor,      # (B, T, A, 4)
+        features: torch.Tensor,      # (B, T, A, 5)
         agent_mask: torch.Tensor,    # (B, T, A) bool
         position_ids: torch.Tensor,  # (B, A) int64
         team_ids: torch.Tensor,      # (B, A) int64
+        slot_ids: torch.Tensor,      # (B, A) int64
     ) -> torch.Tensor:               # (B, A, num_classes)
         # Drop NAN_FILL_VALUE sentinel at padded positions before projection.
         features = features.masked_fill(~agent_mask.unsqueeze(-1), 0.0)
-        x = self.input_proj(features)
+        x = self.input_proj(features)  # (B, T, A, d_model)
+
+        # --- inject identity/role information BEFORE any attention block ---
+        T = x.size(1)
+        x = x + self.temporal_pe[:T].unsqueeze(0).unsqueeze(2)  # (1, T, 1, d_model)
+
+        agent_embed = (
+            self.position_embedding(position_ids)
+            + self.team_embedding(team_ids)
+            + self.slot_embedding(slot_ids)
+        )  # (B, A, d_model)
+        x = x + agent_embed.unsqueeze(1)  # broadcast over T → (B, T, A, d_model)
+
         for block in self.blocks:
             x = block(x, agent_mask)
 
@@ -114,5 +178,4 @@ class CoverageMatchupTransformer(nn.Module):
         pooled = (x * mask_float.unsqueeze(-1)).sum(dim=1) / valid_counts
         # pooled: (B, A, d_model)
 
-        fused = pooled + self.position_embedding(position_ids) + self.team_embedding(team_ids)
-        return self.output_head(fused)  # (B, A, num_classes)
+        return self.output_head(pooled)  # (B, A, num_classes)

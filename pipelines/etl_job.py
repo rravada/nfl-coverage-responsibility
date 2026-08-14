@@ -47,7 +47,7 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.config import NAN_FILL_VALUE, SEASON, TRANSFORMER_FEATURE_COLUMNS
+from src.config import MATCHUP_TARGET_COLUMN, NAN_FILL_VALUE, SEASON, TRANSFORMER_FEATURE_COLUMNS
 from src.data.normalizer import (
     build_normalized_tracking,
     load_games,
@@ -58,6 +58,7 @@ from src.data.normalizer import (
 from src.etl.schema import validate_schema
 from src.etl.transforms import (
     add_frames_since_snap,
+    add_pass_event_markers,
     add_play_group_key,
     add_position_and_team_ids,
     add_snap_frame_marker,
@@ -71,6 +72,10 @@ from src.etl.transforms import (
 _COVERAGE_POSITIONS: frozenset[str] = frozenset(
     {"CB", "FS", "SS", "ILB", "OLB", "LB", "MLB", "DB"}
 )
+# Possession-team offensive skill positions — added as agents purely so the
+# attention mechanism can see receiver positions.  They are never a coverage
+# target themselves (see the matchup_slot=-1 override below).
+_OFFENSE_POSITIONS: frozenset[str] = frozenset({"WR", "TE", "RB", "FB", "QB"})
 _FRAME_KEY: list[str] = ["gameId", "playId", "frameId"]
 _DEFENDER_KEY: list[str] = _FRAME_KEY + ["defender_nflId"]
 _WEEK_RE: re.Pattern[str] = re.compile(r"week(\d+)\.csv", re.IGNORECASE)
@@ -173,14 +178,28 @@ def process_game(
         game_id, normalized.shape, normalized["playId"].nunique(),
     )
 
-    # --- Defender kinematic base (4 raw features only; paper §3.3) ---
+    # --- Agent kinematic base (4 raw features only; paper §3.3) ---
+    # Agents = coverage-position defenders UNION possession-team offensive
+    # skill players (WR/TE/RB/FB/QB) — the model needs to see receiver
+    # positions to learn matchup assignments. The column stays named
+    # `defender_nflId` (historical); it now means "agent nflId".
     kine_cols = _FRAME_KEY + ["nflId", "x", "y", "o_rad", "dir_rad"]
+    is_defender_row = normalized["officialPosition"].isin(_COVERAGE_POSITIONS)
+    is_offense_row = (
+        normalized["officialPosition"].isin(_OFFENSE_POSITIONS)
+        & (normalized["team"] == normalized["possessionTeam"])
+    )
+    agent_row_mask = is_defender_row | is_offense_row
     kine_df = (
         normalized
-        .loc[normalized["officialPosition"].isin(_COVERAGE_POSITIONS), kine_cols]
+        .loc[agent_row_mask, kine_cols]
         .rename(columns={"nflId": "defender_nflId"})
         .reset_index(drop=True)
     )
+    # Carry the offense/defense flag through the label-derivation merges so we
+    # can force matchup_slot=-1 for offensive rows afterward; dropped before
+    # the parquet write (not part of the schema).
+    kine_df["_is_offense_agent"] = is_offense_row.loc[agent_row_mask].values
 
     # --- Nearest-receiver assignment (no Voronoi; pure Euclidean distance) ---
     receiver_assignments = derive_assigned_receiver(normalized)
@@ -204,8 +223,21 @@ def process_game(
     feature_df = derive_coverage_labels(feature_df, game_plays)
     feature_df = derive_matchup_slots(feature_df, normalized, game_plays)
 
+    # Offensive agents are visible to attention but are never a coverage
+    # *target* themselves — force matchup_slot to -1 (CrossEntropyLoss
+    # ignore_index) so they contribute agents/features but no training label.
+    # Without this override derive_matchup_slots would otherwise leave them at
+    # NO_MATCHUP_SLOT (their coverage_label is already "No_Matchup_Zone"
+    # since they have no assigned_receiver_nflId), which is indistinguishable
+    # from a real defender's zone-coverage label.
+    offense_mask = feature_df["_is_offense_agent"].to_numpy()
+    matchup_slot = feature_df[MATCHUP_TARGET_COLUMN].to_numpy().copy()
+    matchup_slot[offense_mask] = -1
+    feature_df[MATCHUP_TARGET_COLUMN] = matchup_slot.astype(np.int8)
+
     # --- Metadata ---
     feature_df = add_snap_frame_marker(feature_df)
+    feature_df = add_pass_event_markers(feature_df)  # paper §3.3 event landmarks
     feature_df = add_frames_since_snap(feature_df)
     feature_df = add_play_group_key(feature_df)
 
@@ -214,7 +246,10 @@ def process_game(
     feature_df = downcast_memory(feature_df)
 
     # Drop working columns that were needed only for label derivation.
-    drop_cols = [c for c in ["event", "assigned_receiver_nflId", "pff_coverage"] if c in feature_df.columns]
+    drop_cols = [
+        c for c in ["event", "assigned_receiver_nflId", "pff_coverage", "_is_offense_agent"]
+        if c in feature_df.columns
+    ]
     feature_df = feature_df.drop(columns=drop_cols)
 
     # --- position_id / team_id (needs team column from raw slice) ---
@@ -255,7 +290,7 @@ def process_game(
         "row_count": row_count,
         "n_plays": n_plays,
         "etl_timestamp": datetime.now(timezone.utc).isoformat(),
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
     }
 
 
